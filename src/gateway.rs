@@ -40,7 +40,7 @@ enum GatewayExit {
 }
 
 fn set_status(shared: &Arc<Mutex<SharedState>>, status: ConnectionStatus, error: Option<String>) {
-    let mut s = shared.lock().unwrap();
+    let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
     s.status = status;
     s.last_error = error;
 }
@@ -66,7 +66,7 @@ pub async fn run_session(
             return Err(e);
         }
     };
-    shared.lock().unwrap().set_me(me);
+    shared.lock().unwrap_or_else(|p| p.into_inner()).set_me(me);
     config::save_token(&token);
 
     let mut session = Session::default();
@@ -97,7 +97,7 @@ pub async fn run_session(
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
 
-        shared.lock().unwrap().status = ConnectionStatus::Reconnecting;
+        shared.lock().unwrap_or_else(|p| p.into_inner()).status = ConnectionStatus::Reconnecting;
 
         let deadline = Instant::now() + backoff;
         loop {
@@ -221,12 +221,34 @@ async fn run_gateway(
                         }
                         match v["op"].as_u64().unwrap_or(0) {
                             0 => {
+                                let event = v["t"].as_str().unwrap_or_default().to_string();
                                 let fresh_ready = handle_dispatch(shared, &v, session);
-                                shared.lock().unwrap().wake();
+                                shared.lock().unwrap_or_else(|p| p.into_inner()).wake();
                                 if fresh_ready {
                                     spawn_fetch_guilds(client.clone(), token.to_string(), shared.clone());
                                     spawn_fetch_dms(client.clone(), token.to_string(), shared.clone());
                                     spawn_fetch_relationships(client.clone(), token.to_string(), shared.clone());
+                                }
+                                // With `guild_subscriptions` on, Discord only sends
+                                // subscription-gated events (typing, presence, member
+                                // updates) for guilds we explicitly request via OP 14.
+                                // Subscribe to every guild on READY (this also triggers
+                                // GUILD_CREATE). Keep the payloads tiny: no channel
+                                // ranges, otherwise oversized OP 14 frames get the
+                                // connection closed with 4002.
+                                if event == "READY" {
+                                    let subs: Vec<Value> = {
+                                        let s = shared.lock().unwrap_or_else(|p| p.into_inner());
+                                        s.guilds
+                                            .iter()
+                                            .map(|g| guild_subscription(&g.id))
+                                            .collect()
+                                    };
+                                    for payload in subs {
+                                        let _ = sink
+                                            .send(WsMessage::Text(payload.to_string().into()))
+                                            .await;
+                                    }
                                 }
                             }
                             7 => {
@@ -262,7 +284,7 @@ async fn run_gateway(
                         tokio::spawn(async move {
                             match rest::send_message(&client, &token, &channel_id, &content, reply_to.as_deref()).await {
                                 Ok(m) => {
-                                    shared.lock().unwrap().add_message(m.clone());
+                                    shared.lock().unwrap_or_else(|p| p.into_inner()).add_message(m.clone());
                                     // Mark our own message as read everywhere.
                                     if let Err(e) = rest::ack_message(&client, &token, &channel_id, &m.id).await {
                                         eprintln!("ack after send failed: {e:#}");
@@ -270,7 +292,7 @@ async fn run_gateway(
                                 }
                                 Err(e) => {
                                     eprintln!("send message failed: {e:#}");
-                                    shared.lock().unwrap().push_error(format!("Failed to send message: {e}"));
+                                    shared.lock().unwrap_or_else(|p| p.into_inner()).push_error(format!("Failed to send message: {e}"));
                                 }
                             }
                         });
@@ -280,7 +302,7 @@ async fn run_gateway(
                         tokio::spawn(async move {
                             match rest::send_attachments(&client, &token, &channel_id, &content, &files, reply_to.as_deref()).await {
                                 Ok(m) => {
-                                    shared.lock().unwrap().add_message(m.clone());
+                                    shared.lock().unwrap_or_else(|p| p.into_inner()).add_message(m.clone());
                                     if let Err(e) = rest::ack_message(&client, &token, &channel_id, &m.id).await {
                                         eprintln!("ack after send failed: {e:#}");
                                     }
@@ -292,7 +314,7 @@ async fn run_gateway(
                                     } else {
                                         format!("Failed to upload attachment: {e}")
                                     };
-                                    shared.lock().unwrap().push_error(msg);
+                                    shared.lock().unwrap_or_else(|p| p.into_inner()).push_error(msg);
                                 }
                             }
                         });
@@ -301,10 +323,10 @@ async fn run_gateway(
                         let (client, token, shared) = (client.clone(), token.to_string(), shared.clone());
                         tokio::spawn(async move {
                             match rest::edit_message(&client, &token, &channel_id, &message_id, &content).await {
-                                Ok(m) => shared.lock().unwrap().add_message(m),
+                                Ok(m) => shared.lock().unwrap_or_else(|p| p.into_inner()).add_message(m),
                                 Err(e) => {
                                     eprintln!("edit message failed: {e:#}");
-                                    shared.lock().unwrap().push_error(format!("Failed to edit message: {e}"));
+                                    shared.lock().unwrap_or_else(|p| p.into_inner()).push_error(format!("Failed to edit message: {e}"));
                                 }
                             }
                         });
@@ -313,10 +335,10 @@ async fn run_gateway(
                         let (client, token, shared) = (client.clone(), token.to_string(), shared.clone());
                         tokio::spawn(async move {
                             match rest::delete_message(&client, &token, &channel_id, &message_id).await {
-                                Ok(()) => shared.lock().unwrap().delete_message(&channel_id, &message_id),
+                                Ok(()) => shared.lock().unwrap_or_else(|p| p.into_inner()).delete_message(&channel_id, &message_id),
                                 Err(e) => {
                                     eprintln!("delete message failed: {e:#}");
-                                    shared.lock().unwrap().push_error(format!("Failed to delete message: {e}"));
+                                    shared.lock().unwrap_or_else(|p| p.into_inner()).push_error(format!("Failed to delete message: {e}"));
                                 }
                             }
                         });
@@ -359,7 +381,7 @@ async fn run_gateway(
                                 Ok(ch) => {
                                     let guild_id = ch.guild_id.clone();
                                     {
-                                        let mut s = shared.lock().unwrap();
+                                        let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                                         s.add_channel(ch);
                                         s.selected_channel = Some(channel_id.clone());
                                         match &guild_id {
@@ -371,7 +393,7 @@ async fn run_gateway(
                                         }
                                     }
                                     if let Some(g) = guild_id {
-                                        if !shared.lock().unwrap().has_channels(&g) {
+                                        if !shared.lock().unwrap_or_else(|p| p.into_inner()).has_channels(&g) {
                                             spawn_fetch_channels(
                                                 client.clone(),
                                                 token.to_string(),
@@ -398,7 +420,7 @@ async fn run_gateway(
                         let (client, token, shared) = (client.clone(), token.to_string(), shared.clone());
                         tokio::spawn(async move {
                             let last = {
-                                let s = shared.lock().unwrap();
+                                let s = shared.lock().unwrap_or_else(|p| p.into_inner());
                                 s.channel_last_message_id(&channel_id)
                             };
                             if let Some(last) = last {
@@ -459,13 +481,13 @@ fn spawn_fetch_messages(
     before: Option<String>,
 ) {
     {
-        let mut s = shared.lock().unwrap();
+        let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
         s.loading_older.insert(channel_id.clone());
         s.mark_known(&channel_id);
     }
     tokio::spawn(async move {
         let result = rest::get_messages(&client, &token, &channel_id, 50, before.as_deref()).await;
-        let mut s = shared.lock().unwrap();
+        let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
         match result {
             Ok(messages) => {
                 if messages.is_empty() {
@@ -486,7 +508,7 @@ fn spawn_fetch_guilds(client: reqwest::Client, token: String, shared: Arc<Mutex<
     tokio::spawn(async move {
         match rest::get_guilds(&client, &token).await {
             Ok(guilds) => {
-                let mut s = shared.lock().unwrap();
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 for guild in guilds {
                     s.upsert_guild(guild);
                 }
@@ -507,7 +529,7 @@ fn spawn_fetch_relationships(
     tokio::spawn(async move {
         match rest::get_relationships(&client, &token).await {
             Ok(relationships) => {
-                let mut s = shared.lock().unwrap();
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 s.set_friends(relationships);
                 let friends = s.friends.iter().filter(|r| r.kind == 1).count();
                 eprintln!("loaded {} friends", friends);
@@ -526,7 +548,7 @@ fn spawn_fetch_channels(
     tokio::spawn(async move {
         match rest::get_guild_channels(&client, &token, &guild_id).await {
             Ok(channels) => {
-                let mut s = shared.lock().unwrap();
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 for channel in channels {
                     s.add_channel(channel);
                 }
@@ -557,7 +579,7 @@ fn spawn_fetch_members(
                         .max()
                         .unwrap_or(after_id);
                     {
-                        let mut s = shared.lock().unwrap();
+                        let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                         for member in members {
                             s.users.insert(member.user.id.clone(), member.user.clone());
                             s.upsert_member(&guild_id, member);
@@ -576,7 +598,7 @@ fn spawn_fetch_members(
                 }
             }
         }
-        let mut s = shared.lock().unwrap();
+        let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
         s.finish_members_fetch(&guild_id);
         eprintln!("loaded {fetched} members for guild {guild_id}");
     });
@@ -591,7 +613,7 @@ fn spawn_fetch_pins(
     tokio::spawn(async move {
         match rest::get_pins(&client, &token, &channel_id).await {
             Ok(pins) => {
-                let mut s = shared.lock().unwrap();
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 s.pins.insert(channel_id, pins);
             }
             Err(e) => eprintln!("fetch pins failed: {e:#}"),
@@ -608,7 +630,7 @@ fn spawn_fetch_profile(
 ) {
     tokio::spawn(async move {
         match rest::get_user_profile(&client, &token, &user_id, guild_id.as_deref()).await {
-            Ok(profile) => shared.lock().unwrap().set_profile(profile),
+            Ok(profile) => shared.lock().unwrap_or_else(|p| p.into_inner()).set_profile(profile),
             Err(e) => eprintln!("fetch profile failed: {e:#}"),
         }
     });
@@ -625,7 +647,7 @@ fn spawn_open_dm(
             Ok(channel) => {
                 let channel_id = channel.id.clone();
                 {
-                    let mut s = shared.lock().unwrap();
+                    let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                     s.add_channel(channel);
                     s.selected_guild = Some(crate::state::DM_HOME.to_string());
                     s.selected_channel = Some(channel_id.clone());
@@ -641,7 +663,7 @@ fn spawn_fetch_dms(client: reqwest::Client, token: String, shared: Arc<Mutex<Sha
     tokio::spawn(async move {
         match rest::get_dm_channels(&client, &token).await {
             Ok(channels) => {
-                let mut s = shared.lock().unwrap();
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 for channel in channels {
                     s.add_channel(channel);
                 }
@@ -652,18 +674,22 @@ fn spawn_fetch_dms(client: reqwest::Client, token: String, shared: Arc<Mutex<Sha
     });
 }
 
-/// Append a dispatch event name to a debug log (best-effort).
-fn log_event(event: &str) {
-    use std::io::Write;
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    let path = std::env::temp_dir().join("discord-rs-events.log");
-    INIT.call_once(|| {
-        let _ = std::fs::write(&path, b"");
-    });
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{event}");
-    }
+/// Builds an OP 14 "guild subscriptions" payload. Enabling `typing` makes
+/// Discord dispatch TYPING_START for the guild; `activities` keeps presence
+/// fresh. Channels are deliberately left empty -- subscribing to every
+/// channel's member ranges bloats the frame and gets the connection closed.
+fn guild_subscription(guild_id: &str) -> Value {
+    json!({
+        "op": 14,
+        "d": {
+            "guild_id": guild_id,
+            "typing": true,
+            "threads": false,
+            "activities": true,
+            "members": [],
+            "channels": {},
+        }
+    })
 }
 
 /// Handles a gateway dispatch (op 0) event. Returns `true` when a fresh READY
@@ -671,11 +697,10 @@ fn log_event(event: &str) {
 fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Session) -> bool {
     let event = v["t"].as_str().unwrap_or_default();
     let data = &v["d"];
-    log_event(event);
 
     match event {
 "READY" => {
-            let mut s = shared.lock().unwrap();
+            let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
             s.status = ConnectionStatus::Connected;
             if let Some(sid) = data["session_id"].as_str() {
                 session.session_id = Some(sid.to_string());
@@ -720,7 +745,7 @@ fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Se
             return true;
         }
         "RESUMED" => {
-            shared.lock().unwrap().status = ConnectionStatus::Connected;
+            shared.lock().unwrap_or_else(|p| p.into_inner()).status = ConnectionStatus::Connected;
             session.ready_this_run = true;
             eprintln!("gateway: RESUMED");
         }
@@ -728,7 +753,7 @@ fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Se
             if let Ok(guild) = serde_json::from_value::<Guild>(data.clone()) {
                 let guild_id = guild.id.clone();
                 let has_members = !guild.members.is_empty();
-                let mut s = shared.lock().unwrap();
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 for channel in &guild.channels {
                     s.add_channel(channel.clone());
                 }
@@ -748,7 +773,7 @@ fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Se
                 data["guild_id"].as_str(),
                 data["position"].as_i64(),
             ) {
-                let mut s = shared.lock().unwrap();
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(g) = s.guilds.iter_mut().find(|g| g.id == guild_id) {
                     g.position = pos as i32;
                 }
@@ -760,7 +785,7 @@ fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Se
                 data["guild_id"].as_str(),
                 serde_json::from_value::<crate::model::Member>(data.clone()),
             ) {
-                let mut s = shared.lock().unwrap();
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 s.users.insert(member.user.id.clone(), member.user.clone());
                 s.upsert_member(guild_id, member);
             }
@@ -769,17 +794,17 @@ fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Se
             if let Some(user_id) = data["user"]["id"].as_str() {
                 let status = data["status"].as_str().unwrap_or("offline");
                 let guild_id = data["guild_id"].as_str().unwrap_or("");
-                shared.lock().unwrap().set_presence(guild_id, user_id, status);
+                shared.lock().unwrap_or_else(|p| p.into_inner()).set_presence(guild_id, user_id, status);
             }
         }
         "CHANNEL_CREATE" | "CHANNEL_UPDATE" => {
             if let Ok(channel) = serde_json::from_value::<Channel>(data.clone()) {
-                shared.lock().unwrap().add_channel(channel);
+                shared.lock().unwrap_or_else(|p| p.into_inner()).add_channel(channel);
             }
         }
         "MESSAGE_CREATE" => {
             if let Ok(message) = serde_json::from_value::<Message>(data.clone()) {
-                shared.lock().unwrap().receive_message(message);
+                shared.lock().unwrap_or_else(|p| p.into_inner()).receive_message(message);
             }
             return false;
         }
@@ -787,7 +812,7 @@ fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Se
             if let (Some(channel_id), Some(user_id)) =
                 (data["channel_id"].as_str(), data["user_id"].as_str())
             {
-                let mut s = shared.lock().unwrap();
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 let is_me = s.me.as_ref().map(|u| u.id.as_str()) == Some(user_id);
                 if !is_me {
                     let name = data["member"]["user"]["global_name"]
@@ -814,7 +839,7 @@ fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Se
                 data["user_id"].as_str(),
                 serde_json::from_value::<Emoji>(data["emoji"].clone()),
             ) {
-                let mut s = shared.lock().unwrap();
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 let from_me = s.me.as_ref().map(|u| u.id.as_str()) == Some(user_id);
                 s.react_add(channel_id, message_id, emoji, from_me);
             }
@@ -826,7 +851,7 @@ fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Se
                 data["user_id"].as_str(),
                 serde_json::from_value::<Emoji>(data["emoji"].clone()),
             ) {
-                let mut s = shared.lock().unwrap();
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 let from_me = s.me.as_ref().map(|u| u.id.as_str()) == Some(user_id);
                 s.react_remove(channel_id, message_id, emoji, from_me);
             }
@@ -838,8 +863,7 @@ fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Se
                 if let Some(content) = data["content"].as_str() {
                     let edited = data["edited_timestamp"].as_str().map(|s| s.to_string());
                     shared
-                        .lock()
-                        .unwrap()
+                        .lock().unwrap_or_else(|p| p.into_inner())
                         .update_message(channel_id, message_id, content.to_string(), edited);
                 }
             }
@@ -848,7 +872,7 @@ fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Se
             if let (Some(channel_id), Some(message_id)) =
                 (data["channel_id"].as_str(), data["id"].as_str())
             {
-                shared.lock().unwrap().delete_message(channel_id, message_id);
+                shared.lock().unwrap_or_else(|p| p.into_inner()).delete_message(channel_id, message_id);
             }
         }
         _ => {}

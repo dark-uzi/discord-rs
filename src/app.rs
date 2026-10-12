@@ -1,13 +1,18 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local, NaiveDate};
 use eframe::egui::{self, RichText};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config;
+use crate::format::{active_autocomplete, active_shortcode, big_emoji, is_image_path, parse_ts, preview_text, twemoji_url, typing_label, youtube_id, EMOJIS, EmojiTok};
+use crate::markdown::{self, Seg};
 use crate::model::{Attachment, Embed, Emoji, Member, Message, User};
 use crate::state::{Command, ConnectionStatus, LogEntry, LogKind, PendingFile, SharedState, DM_HOME};
+use crate::widgets::{avatar_ring, badge, emoji_button, encode_png, flatten_menu, image_fit, open_url, presence_rank, render_plain, render_reply_line, window_header};
+
+#[cfg(target_os = "windows")]
+use crate::widgets::dib_to_rgba;
 
 struct ReplyTarget {
     channel_id: String,
@@ -100,6 +105,8 @@ pub struct App {
     focus_input: bool,
     settings: config::Settings,
     settings_open: bool,
+    settings_anchor: Option<egui::Rect>,
+    cursor_pos: Option<egui::Pos2>,
     profile_open: Option<ProfileView>,
     copied_at: Option<Instant>,
     nickname_edit: Option<NicknameEdit>,
@@ -145,6 +152,7 @@ struct ProfileView {
     user_id: String,
     guild_id: Option<String>,
     requested: bool,
+    pos: egui::Pos2,
 }
 
 /// Target for "jump to message" (from pinned messages): select the channel and
@@ -179,6 +187,8 @@ impl App {
             focus_input: false,
             settings: config::load_settings(),
             settings_open: false,
+            settings_anchor: None,
+            cursor_pos: None,
             profile_open: None,
             copied_at: None,
             nickname_edit: None,
@@ -213,17 +223,31 @@ impl App {
     }
 
     fn open_profile(&mut self, user_id: String, guild_id: Option<String>) {
+        let pos = self.cursor_pos.unwrap_or(egui::pos2(320.0, 200.0));
         self.profile_open = Some(ProfileView {
             user_id,
             guild_id,
             requested: false,
+            pos,
         });
+    }
+
+    /// A default position that drops a roughly `w`x`h` window in the middle of
+    /// the screen (used so popups don't spawn in the top-left corner).
+    fn center_pos(&self, ui: &egui::Ui, w: f32, h: f32) -> egui::Pos2 {
+        let screen = ui.ctx().input(|i| i.raw.screen_rect).unwrap_or_else(|| {
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))
+        });
+        egui::pos2(
+            (screen.center().x - w * 0.5).max(8.0),
+            (screen.center().y - h * 0.5).max(8.0),
+        )
     }
 
     /// Candidate users for the `@` autocomplete: current guild's members,
     /// friends, then any other known users.
     fn autocomplete_users(&self) -> Vec<(String, String)> {
-        let s = self.shared.lock().unwrap();
+        let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out: Vec<(String, String)> = Vec::new();
         if let Some(gid) = s.selected_guild.as_ref() {
@@ -256,7 +280,7 @@ impl App {
 
     /// Candidate text channels for the `#` autocomplete in the current guild.
     fn autocomplete_channels(&self) -> Vec<(String, String)> {
-        let s = self.shared.lock().unwrap();
+        let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
         let Some(gid) = s.selected_guild.as_ref() else {
             return Vec::new();
         };
@@ -271,7 +295,7 @@ impl App {
                 (c.id, name)
             })
             .collect();
-        chans.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        chans.sort_by_key(|a| a.1.to_lowercase());
         chans
     }
 
@@ -350,8 +374,7 @@ impl App {
             .unwrap_or(false);
         if !has_text {
             self.shared
-                .lock()
-                .unwrap()
+                .lock().unwrap_or_else(|p| p.into_inner())
                 .push_error("No image found in the clipboard.");
         }
         false
@@ -362,7 +385,7 @@ impl App {
         if dropped.is_empty() {
             return;
         }
-        if self.shared.lock().unwrap().selected_channel.is_none() {
+        if self.shared.lock().unwrap_or_else(|p| p.into_inner()).selected_channel.is_none() {
             return;
         }
         for f in dropped {
@@ -391,7 +414,7 @@ impl App {
         let mut fetch_channels: Option<String> = None;
         let mut resolve: Option<String> = None;
         {
-            let mut s = self.shared.lock().unwrap();
+            let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             let guild = s.channels.get(channel_id).map(|c| {
                 if c.guild_id.is_none() && c.is_dm() {
                     DM_HOME.to_string()
@@ -430,13 +453,13 @@ impl App {
     /// history and release their decoded image bytes/textures. This keeps RAM
     /// from growing with every chat (and picture) the user has visited.
     fn reap_channel_memory(&mut self, ctx: &egui::Context) {
-        let current = self.shared.lock().unwrap().selected_channel.clone();
+        let current = self.shared.lock().unwrap_or_else(|p| p.into_inner()).selected_channel.clone();
         if current == self.mem_last_channel {
             return;
         }
         self.mem_last_channel = current.clone();
         let uris = {
-            let mut s = self.shared.lock().unwrap();
+            let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             s.drop_history_except(current.as_deref())
         };
         let keep = self.image_view.clone();
@@ -452,7 +475,7 @@ impl App {
     /// playing a sound. Runs every frame regardless of the selected server.
     fn pump_notices(&mut self, ctx: &egui::Context) {
         let (notices, errors) = {
-            let mut s = self.shared.lock().unwrap();
+            let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             (s.take_notices(), s.take_errors())
         };
         let mut added = false;
@@ -579,14 +602,16 @@ impl App {
         }
         let mut open = true;
         let mut jump: Option<String> = None;
+        let dpos = self.center_pos(ui, 380.0, 440.0);
         egui::Window::new("Notifications")
             .open(&mut open)
             .resizable(true)
+            .default_pos(dpos)
             .default_width(380.0)
             .default_height(440.0)
             .show(ui.ctx(), |ui| {
                 let items: Vec<(String, String, String, bool)> = {
-                    let s = self.shared.lock().unwrap();
+                    let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                     s.notice_log()
                         .iter()
                         .map(|n| {
@@ -600,7 +625,7 @@ impl App {
                         .collect()
                 };
                 let ids: Vec<String> = {
-                    let s = self.shared.lock().unwrap();
+                    let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                     s.notice_log().iter().map(|n| n.channel_id.clone()).collect()
                 };
                 if items.is_empty() {
@@ -644,12 +669,12 @@ impl App {
     }
 
     fn status(&self) -> ConnectionStatus {
-        self.shared.lock().unwrap().status.clone()
+        self.shared.lock().unwrap_or_else(|p| p.into_inner()).status.clone()
     }
 
     fn ui_login(&mut self, ui: &mut egui::Ui) {
         let status = self.status();
-        let error = self.shared.lock().unwrap().last_error.clone();
+        let error = self.shared.lock().unwrap_or_else(|p| p.into_inner()).last_error.clone();
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(60.0);
@@ -869,7 +894,7 @@ impl App {
                 let q = self.switcher_query.trim().to_lowercase();
                 let mut entries: Vec<(String, String, String)> = Vec::new();
                 {
-                    let s = self.shared.lock().unwrap();
+                    let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                     for guild in &s.guilds {
                         for ch in s.text_channels(&guild.id) {
                             entries.push((
@@ -905,7 +930,7 @@ impl App {
         }
         if let Some((guild_id, channel_id)) = chosen {
             {
-                let mut s = self.shared.lock().unwrap();
+                let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                 s.selected_guild = Some(guild_id);
                 s.selected_channel = Some(channel_id.clone());
                 s.clear_unread(&channel_id);
@@ -926,9 +951,10 @@ impl App {
         let user_id = view.user_id.clone();
         let guild_id = view.guild_id.clone();
         let requested = view.requested;
+        let view_pos = view.pos;
 
         let (user, have_full) = {
-            let s = self.shared.lock().unwrap();
+            let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             let full = s.profiles.get(&user_id).cloned();
             let have_full = full.is_some();
             let base = full.or_else(|| s.profile(&user_id).cloned());
@@ -954,11 +980,22 @@ impl App {
             .map(|t| t.elapsed() < Duration::from_millis(1200))
             .unwrap_or(false);
         let mut close = false;
+        let screen = ui
+            .ctx()
+            .input(|i| i.raw.screen_rect)
+            .unwrap_or_else(|| {
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))
+            });
+        let prof_pos = egui::pos2(
+            view_pos.x.clamp(8.0, (screen.right() - 360.0).max(8.0)),
+            (view_pos.y - 40.0).clamp(8.0, (screen.bottom() - 200.0).max(8.0)),
+        );
         egui::Window::new("Profile")
             .id(egui::Id::new("profile_window"))
             .title_bar(false)
             .collapsible(false)
             .resizable(true)
+            .default_pos(prof_pos)
             .default_size([340.0, 460.0])
             .min_size([260.0, 180.0])
             .show(ui.ctx(), |ui| {
@@ -970,7 +1007,7 @@ impl App {
                     .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add(
-                        egui::Image::new(&user.avatar_url(160))
+                        egui::Image::new(user.avatar_url(160))
                             .fit_to_exact_size(egui::vec2(96.0, 96.0))
                             .corner_radius(48.0),
                     );
@@ -1004,8 +1041,7 @@ impl App {
                     }
                     let is_self = self
                         .shared
-                        .lock()
-                        .unwrap()
+                        .lock().unwrap_or_else(|p| p.into_inner())
                         .me
                         .as_ref()
                         .map(|m| m.id == user.id)
@@ -1028,12 +1064,27 @@ impl App {
         }
         let mut close = false;
         let mut changed = false;
-        egui::Window::new("Settings")
+        let screen = ui
+            .ctx()
+            .input(|i| i.raw.screen_rect)
+            .unwrap_or_else(|| {
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))
+            });
+        let settings_pos = self.settings_anchor.map(|r| {
+            egui::pos2(
+                (r.right() - 340.0).clamp(8.0, (screen.right() - 348.0).max(8.0)),
+                (r.bottom() + 6.0).clamp(8.0, (screen.bottom() - 120.0).max(8.0)),
+            )
+        });
+        let mut win = egui::Window::new("Settings")
             .id(egui::Id::new("settings_window"))
             .title_bar(false)
             .collapsible(false)
-            .resizable(true)
-            .show(ui.ctx(), |ui| {
+            .resizable(true);
+        if let Some(p) = settings_pos {
+            win = win.default_pos(p);
+        }
+        win.show(ui.ctx(), |ui| {
                 ui.set_min_width(300.0);
                 close = window_header(ui, "Settings");
                 ui.separator();
@@ -1063,6 +1114,12 @@ impl App {
                             .changed();
                         changed |= ui
                             .checkbox(&mut self.settings.theme_dark, "Dark theme")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.settings.scroll_speed, 0.5..=4.0)
+                                    .text("Scroll speed"),
+                            )
                             .changed();
                     });
                 egui::CollapsingHeader::new("Content")
@@ -1138,6 +1195,7 @@ impl App {
     }
 
     fn nickname_window(&mut self, ui: &mut egui::Ui) {
+        let dpos = self.center_pos(ui, 280.0, 150.0);
         let Some(edit) = self.nickname_edit.as_mut() else {
             return;
         };
@@ -1150,6 +1208,7 @@ impl App {
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            .default_pos(dpos)
             .show(ui.ctx(), |ui| {
                 ui.set_min_width(280.0);
                 close = window_header(ui, "Set Nickname");
@@ -1181,8 +1240,7 @@ impl App {
         if save {
             if let Some(edit) = self.nickname_edit.take() {
                 self.shared
-                    .lock()
-                    .unwrap()
+                    .lock().unwrap_or_else(|p| p.into_inner())
                     .set_alias(&edit.scope, &edit.user_id, &edit.input);
             }
         } else if close {
@@ -1196,10 +1254,12 @@ impl App {
         }
         let enabled = self.settings.message_log;
         let time_24h = self.settings.time_24h;
-        let entries: Vec<LogEntry> = self.shared.lock().unwrap().message_log.clone();
+        let entries: Vec<LogEntry> = self.shared.lock().unwrap_or_else(|p| p.into_inner()).message_log.clone();
         let mut open = true;
+        let dpos = self.center_pos(ui, 460.0, 400.0);
         egui::Window::new("Message Log")
             .id(egui::Id::new("log_window"))
+            .default_pos(dpos)
             .default_size([460.0, 400.0])
             .resizable(true)
             .open(&mut open)
@@ -1265,7 +1325,7 @@ impl App {
         if !self.pins_open {
             return;
         }
-        let Some(cid) = self.shared.lock().unwrap().selected_channel.clone() else {
+        let Some(cid) = self.shared.lock().unwrap_or_else(|p| p.into_inner()).selected_channel.clone() else {
             self.pins_open = false;
             return;
         };
@@ -1273,7 +1333,7 @@ impl App {
         let mut request_pins = false;
         let mut jump: Option<(String, String)> = None;
         {
-            let s = self.shared.lock().unwrap();
+            let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             if !s.pins.contains_key(&cid) {
                 request_pins = true;
             }
@@ -1295,7 +1355,7 @@ impl App {
                     });
                 });
                 ui.separator();
-                let s = self.shared.lock().unwrap();
+                let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                 match s.pins.get(&cid) {
                     Some(pins) if !pins.is_empty() => {
                         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1347,7 +1407,7 @@ impl App {
                 tried: None,
             });
             {
-                let mut s = self.shared.lock().unwrap();
+                let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                 s.selected_channel = Some(cid.clone());
                 s.clear_unread(&cid);
             }
@@ -1360,7 +1420,7 @@ impl App {
         if !self.settings.show_member_list {
             return;
         }
-        let Some(gid) = self.shared.lock().unwrap().selected_guild.clone() else {
+        let Some(gid) = self.shared.lock().unwrap_or_else(|p| p.into_inner()).selected_guild.clone() else {
             return;
         };
         if gid == DM_HOME {
@@ -1374,7 +1434,7 @@ impl App {
         let mut nickname: Option<NicknameEdit> = None;
         let mut request_members = false;
         {
-            let mut s = self.shared.lock().unwrap();
+            let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             if s.guild_members(&gid).is_empty() && s.begin_members_fetch(&gid) {
                 request_members = true;
             }
@@ -1387,7 +1447,7 @@ impl App {
             .resizable(false)
             .show(ui, |ui| {
                 ui.add_space(8.0);
-                let s = self.shared.lock().unwrap();
+                let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                 let mut members = s.guild_members(&gid);
                 let guild = s.guilds.iter().find(|g| g.id == gid);
                 let rank = |uid: &str| -> u8 {
@@ -1513,15 +1573,32 @@ impl App {
             .ctx()
             .input(|i| i.raw.screen_rect)
             .unwrap_or_else(|| egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0)));
+        // Natural display size of the image, capped to most of the screen, and
+        // the viewport we size the window to (so there's no letterbox padding).
+        let max_view = egui::vec2(screen.width() * 0.85, screen.height() * 0.85);
+        let nat = egui::Image::new(&url)
+            .load_and_calc_size(ui, max_view)
+            .filter(|s| s.x > 1.0 && s.y > 1.0)
+            .unwrap_or(egui::vec2(480.0, 360.0));
+        let aspect = (nat.x / nat.y.max(1.0)).max(0.05);
+        let mut base = nat;
+        if base.x > max_view.x {
+            base = egui::vec2(max_view.x, max_view.x / aspect);
+        }
+        if base.y > max_view.y {
+            base = egui::vec2(max_view.y * aspect, max_view.y);
+        }
+        let target0 = base * zoom;
+        let viewport = egui::vec2(target0.x.min(max_view.x), target0.y.min(max_view.y));
+
         egui::Window::new("Image")
             .id(egui::Id::new("image_viewer"))
             .title_bar(false)
             .collapsible(false)
-            .resizable(true)
-            .default_pos(egui::pos2(screen.center().x - 320.0, screen.center().y - 240.0))
-            .default_size(egui::vec2(
-                (screen.width() * 0.6).max(320.0),
-                (screen.height() * 0.6).max(240.0),
+            .resizable(false)
+            .default_pos(egui::pos2(
+                screen.center().x - viewport.x * 0.5,
+                screen.center().y - viewport.y * 0.5 - 24.0,
             ))
             .show(ui.ctx(), |ui| {
                 close = window_header(ui, "Image");
@@ -1547,54 +1624,57 @@ impl App {
                         }
                     });
                 });
-                let viewport = ui.available_rect_before_wrap();
+                ui.allocate_ui(viewport, |ui| {
+                    let viewport_rect = ui.available_rect_before_wrap();
 
-                // Button zoom keeps the view centred.
-                if zoom != prev_zoom && prev_zoom > 0.0 {
-                    let c = viewport.center() - viewport.min;
-                    let ratio = zoom / prev_zoom;
-                    pan = (pan + c) * ratio - c;
-                }
+                    // Button zoom keeps the view centred.
+                    if zoom != prev_zoom && prev_zoom > 0.0 {
+                        let c = viewport_rect.center() - viewport_rect.min;
+                        let ratio = zoom / prev_zoom;
+                        pan = (pan + c) * ratio - c;
+                    }
 
-                // Wheel = zoom toward the cursor (not pan).
-                let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
-                let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
-                if scroll != 0.0 {
-                    if let Some(p) = pointer {
-                        if viewport.contains(p) {
-                            let z_old = zoom;
-                            zoom = (zoom * (1.0 + scroll * 0.0018)).clamp(0.25, 8.0);
-                            let focal = p - viewport.min;
-                            let ratio = zoom / z_old;
-                            pan = (pan + focal) * ratio - focal;
+                    // Wheel = zoom toward the cursor (not pan).
+                    let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
+                    let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+                    if scroll != 0.0 {
+                        if let Some(p) = pointer {
+                            if viewport_rect.contains(p) {
+                                let z_old = zoom;
+                                zoom = (zoom * (1.0 + scroll * 0.0018)).clamp(0.25, 8.0);
+                                let focal = p - viewport_rect.min;
+                                let ratio = zoom / z_old;
+                                pan = (pan + focal) * ratio - focal;
+                            }
                         }
                     }
-                }
 
-                let target = viewport.size() * zoom;
-                let mut drag = egui::Vec2::ZERO;
-                let output = egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .animated(false)
-                    .wheel_scroll_multiplier(egui::vec2(0.0, 0.0))
-                    .scroll_offset(pan)
-                    .show(ui, |ui| {
-                        let resp = ui.add(
-                            egui::Image::new(&url)
-                                .fit_to_exact_size(target)
-                                .maintain_aspect_ratio(true)
-                                .sense(egui::Sense::drag()),
-                        );
-                        if resp.dragged() {
-                            drag = resp.drag_delta();
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                        } else if resp.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-                        }
-                    });
-                // Content follows the cursor: dragging right/down decreases the offset.
-                let max_off = (output.content_size - output.inner_rect.size()).max(egui::Vec2::ZERO);
-                pan = (output.state.offset - drag).clamp(egui::Vec2::ZERO, max_off);
+                    let img_target = base * zoom;
+                    let mut drag = egui::Vec2::ZERO;
+                    let output = egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .animated(false)
+                        .wheel_scroll_multiplier(egui::vec2(0.0, 0.0))
+                        .scroll_offset(pan)
+                        .show(ui, |ui| {
+                            let resp = ui.add(
+                                egui::Image::new(&url)
+                                    .fit_to_exact_size(img_target)
+                                    .maintain_aspect_ratio(true)
+                                    .sense(egui::Sense::drag()),
+                            );
+                            if resp.dragged() {
+                                drag = resp.drag_delta();
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                            } else if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                            }
+                        });
+                    // Content follows the cursor: dragging right/down decreases the offset.
+                    let max_off =
+                        (output.content_size - output.inner_rect.size()).max(egui::Vec2::ZERO);
+                    pan = (output.state.offset - drag).clamp(egui::Vec2::ZERO, max_off);
+                });
             });
         self.image_zoom = zoom;
         self.image_pan = pan;
@@ -1615,11 +1695,13 @@ impl App {
         };
         let mut close = false;
         let mut chosen: Option<String> = None;
+        let dpos = self.center_pos(ui, 340.0, 380.0);
         egui::Window::new("Emoji")
             .id(egui::Id::new("emoji_picker"))
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            .default_pos(dpos)
             .show(ui.ctx(), |ui| {
                 close = window_header(ui, "Emoji");
                 ui.separator();
@@ -1686,7 +1768,7 @@ impl App {
                         name: Some(emoji.clone()),
                         animated: None,
                     };
-                    self.shared.lock().unwrap().react_add(
+                    self.shared.lock().unwrap_or_else(|p| p.into_inner()).react_add(
                         channel_id,
                         message_id,
                         em.clone(),
@@ -1711,7 +1793,7 @@ impl App {
         let mut open_self: Option<String> = None;
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                let s = self.shared.lock().unwrap();
+                let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(me) = &s.me {
                     let name = me.display_name();
                     if ui
@@ -1729,8 +1811,10 @@ impl App {
                     if ui.button("Log out").clicked() {
                         let _ = self.cmd_tx.send(Command::Disconnect);
                     }
-                    if ui.button("Settings").clicked() {
+                    let settings_btn = ui.button("Settings");
+                    if settings_btn.clicked() {
                         self.settings_open = true;
+                        self.settings_anchor = Some(settings_btn.rect);
                     }
                     let bell = if self.unseen_notifications {
                         "\u{1F514}\u{2022}"
@@ -1782,7 +1866,7 @@ impl App {
             .resizable(false)
             .show(ui, |ui| {
                 ui.add_space(8.0);
-                let s = self.shared.lock().unwrap();
+                let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                 let dm_selected = s.selected_guild.as_deref() == Some(DM_HOME);
                 let dm_unread = s.dm_unread_total();
                 let dm_mentions = s.dm_mentions_total();
@@ -1857,13 +1941,13 @@ impl App {
             });
 
         if let Some(id) = pin_toggle {
-            self.shared.lock().unwrap().toggle_pin_guild(&id);
+            self.shared.lock().unwrap_or_else(|p| p.into_inner()).toggle_pin_guild(&id);
         }
 
         if let Some(id) = clicked {
-            let changed = self.shared.lock().unwrap().selected_guild.as_deref() != Some(id.as_str());
+            let changed = self.shared.lock().unwrap_or_else(|p| p.into_inner()).selected_guild.as_deref() != Some(id.as_str());
             {
-                let mut s = self.shared.lock().unwrap();
+                let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                 s.selected_guild = Some(id.clone());
                 if changed {
                     s.selected_channel = None;
@@ -1872,10 +1956,10 @@ impl App {
             if id == DM_HOME {
                 let _ = self.cmd_tx.send(Command::FetchDms);
             } else {
-                if !self.shared.lock().unwrap().has_channels(&id) {
+                if !self.shared.lock().unwrap_or_else(|p| p.into_inner()).has_channels(&id) {
                     let _ = self.cmd_tx.send(Command::FetchGuildChannels(id.clone()));
                 }
-                let request_members = self.shared.lock().unwrap().begin_members_fetch(&id);
+                let request_members = self.shared.lock().unwrap_or_else(|p| p.into_inner()).begin_members_fetch(&id);
                 if request_members {
                     let _ = self.cmd_tx.send(Command::FetchGuildMembers(id));
                 }
@@ -1897,7 +1981,7 @@ impl App {
             .exact_size(200.0)
             .resizable(false)
             .show(ui, |ui| {
-                let s = self.shared.lock().unwrap();
+                let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                 let Some(guild_id) = s.selected_guild.clone() else {
                     ui.add_space(8.0);
                     ui.label("Select a server or Direct Messages");
@@ -1959,17 +2043,16 @@ impl App {
                                     let label = format!("{} \u{2014} {}", name, status);
                                     let mut hit = false;
                                     let resp = ui.horizontal(|ui| {
-                                        if show_avatars {
-                                            if avatar_ring(
+                                        if show_avatars
+                                            && avatar_ring(
                                                 ui,
                                                 &u.avatar_url(64),
                                                 24.0,
                                                 Some(status),
                                             )
                                             .clicked()
-                                            {
-                                                hit = true;
-                                            }
+                                        {
+                                            hit = true;
                                         }
                                         if ui.selectable_label(false, name.clone()).clicked() {
                                             hit = true;
@@ -2141,7 +2224,7 @@ impl App {
             self.nickname_edit = Some(n);
         }
         if let Some((is_guild, id)) = pin_toggle {
-            let mut s = self.shared.lock().unwrap();
+            let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             if is_guild {
                 s.toggle_pin_guild(&id);
             } else {
@@ -2150,7 +2233,7 @@ impl App {
         }
 
         if let Some(id) = clicked {
-            let mut s = self.shared.lock().unwrap();
+            let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             s.selected_channel = Some(id.clone());
             s.clear_unread(&id);
             drop(s);
@@ -2158,7 +2241,7 @@ impl App {
             let _ = self.cmd_tx.send(Command::FetchMessages(id));
         }
         if let Some(id) = mark_read {
-            self.shared.lock().unwrap().clear_unread(&id);
+            self.shared.lock().unwrap_or_else(|p| p.into_inner()).clear_unread(&id);
             let _ = self.cmd_tx.send(Command::AckChannel(id));
         }
         if let Some(v) = set_friends {
@@ -2172,7 +2255,7 @@ impl App {
 
     fn message_view(&mut self, ui: &mut egui::Ui) {
         let shared = self.shared.clone();
-        let s = shared.lock().unwrap();
+        let s = shared.lock().unwrap_or_else(|p| p.into_inner());
 
         let Some(channel_id) = s.selected_channel.clone() else {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -2253,7 +2336,10 @@ impl App {
             let search = self.search.trim().to_lowercase();
 
             let jump = self.jump_bottom;
-            let mut scroll = egui::ScrollArea::vertical().stick_to_bottom(true);
+            let scroll_speed = self.settings.scroll_speed.max(0.2);
+            let mut scroll = egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
+                .wheel_scroll_multiplier(egui::vec2(scroll_speed, scroll_speed));
             if let Some(o) = self.scroll_override.take() {
                 scroll = scroll.vertical_scroll_offset(o);
             }
@@ -2395,8 +2481,7 @@ impl App {
         if let Some(keep) = trim_to {
             let uris = self
                 .shared
-                .lock()
-                .unwrap()
+                .lock().unwrap_or_else(|p| p.into_inner())
                 .trim_channel_history(&channel_id, keep);
             for u in uris {
                 ui.ctx().forget_image(&u);
@@ -2474,12 +2559,12 @@ impl App {
                 message_id,
             }) => {
                 let already = {
-                    let s = self.shared.lock().unwrap();
+                    let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                     s.selected_channel.as_deref() == Some(channel_id.as_str())
                 };
                 if !already {
                     {
-                        let mut s = self.shared.lock().unwrap();
+                        let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
                         s.selected_channel = Some(channel_id.clone());
                         s.clear_unread(&channel_id);
                     }
@@ -2537,8 +2622,7 @@ impl App {
                 let key = emoji.key();
                 let added = self
                     .shared
-                    .lock()
-                    .unwrap()
+                    .lock().unwrap_or_else(|p| p.into_inner())
                     .toggle_reaction(&channel_id, &message_id, emoji);
                 if let Some(added) = added {
                     let cmd = if added {
@@ -2562,11 +2646,11 @@ impl App {
     }
 
     fn input_bar(&mut self, ui: &mut egui::Ui) {
-        let channel_id = self.shared.lock().unwrap().selected_channel.clone();
+        let channel_id = self.shared.lock().unwrap_or_else(|p| p.into_inner()).selected_channel.clone();
         let enabled = channel_id.is_some();
         let typing: Vec<String> = channel_id
             .as_ref()
-            .map(|cid| self.shared.lock().unwrap().typing_names(cid))
+            .map(|cid| self.shared.lock().unwrap_or_else(|p| p.into_inner()).typing_names(cid))
             .unwrap_or_default();
         let mut submit = false;
         let mut cancel_edit = false;
@@ -2793,10 +2877,8 @@ impl App {
             ui.add_space(4.0);
         });
 
-        if cancel_edit {
-            if self.editing.take().is_some() {
-                self.draft.clear();
-            }
+        if cancel_edit && self.editing.take().is_some() {
+            self.draft.clear();
         }
         if cancel_reply {
             self.replying_to = None;
@@ -2871,7 +2953,7 @@ impl App {
         let mut fetch_channels: Option<String> = None;
         let mut fetch_messages: Option<String> = None;
         {
-            let mut s = self.shared.lock().unwrap();
+            let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             if !matches!(s.status, ConnectionStatus::Connected) || s.guilds.is_empty() {
                 return;
             }
@@ -2910,7 +2992,7 @@ impl App {
         if self.emoji_picker.is_some() || self.image_view.is_some() {
             return true;
         }
-        let s = self.shared.lock().unwrap();
+        let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
         if matches!(
             s.status,
             ConnectionStatus::Connecting | ConnectionStatus::Reconnecting
@@ -2932,14 +3014,14 @@ impl eframe::App for App {
             ui.ctx().request_repaint_after(Duration::from_millis(ms));
         }
         {
-            let mut s = self.shared.lock().unwrap();
+            let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             if s.repaint.is_none() {
                 s.repaint = Some(ui.ctx().clone());
             }
         }
+        self.cursor_pos = ui.ctx().input(|i| i.pointer.interact_pos());
         self.shared
-            .lock()
-            .unwrap()
+            .lock().unwrap_or_else(|p| p.into_inner())
             .set_message_cap(if self.settings.performance_mode { 120 } else { 300 });
         let visuals = self.settings.theme_dark;
         if self.visuals_dark != Some(visuals) {
@@ -2951,9 +3033,9 @@ impl eframe::App for App {
             }
         }
 
-        let logged_in = self.shared.lock().unwrap().me.is_some();
+        let logged_in = self.shared.lock().unwrap_or_else(|p| p.into_inner()).me.is_some();
         if logged_in {
-            let unread = self.shared.lock().unwrap().total_unread();
+            let unread = self.shared.lock().unwrap_or_else(|p| p.into_inner()).total_unread();
             let title = if unread > 0 {
                 format!("Discord ({unread})")
             } else {
@@ -2981,6 +3063,7 @@ impl eframe::App for App {
 // Rendering
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn render_message(
     ui: &mut egui::Ui,
     message: &Message,
@@ -3542,18 +3625,6 @@ fn member_display_name(
     m.user.display_name()
 }
 
-fn typing_label(names: &[String]) -> String {
-    match names {
-        [] => String::new(),
-        [a] => format!("{a} is typing\u{2026}"),
-        [a, b] => format!("{a} and {b} are typing\u{2026}"),
-        [a, b, c] => format!("{a}, {b} and {c} are typing\u{2026}"),
-        [a, b, rest @ ..] => {
-            format!("{a}, {b} and {} others are typing\u{2026}", rest.len())
-        }
-    }
-}
-
 fn render_channel_rows(
     ui: &mut egui::Ui,
     s: &SharedState,
@@ -3598,239 +3669,6 @@ fn render_voice_rows(ui: &mut egui::Ui, channels: &[&crate::model::Channel]) {
     for channel in channels {
         ui.weak(format!("\u{1F50A} {}", channel.display_name()));
     }
-}
-
-fn active_shortcode(s: &str) -> Option<(usize, String)> {
-    let idx = s.rfind(':')?;
-    let after = &s[idx + 1..];
-    if after.is_empty() || after.len() > 32 {
-        return None;
-    }
-    if !after
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '+')
-    {
-        return None;
-    }
-    if idx > 0 {
-        let prev = s[..idx].chars().next_back().unwrap();
-        if !prev.is_whitespace() {
-            return None;
-        }
-    }
-    Some((idx, after.to_string()))
-}
-
-/// Detect an in-progress `@user` or `#channel` token at the end of the draft.
-/// Returns `(start_byte_index, kind, query)`.
-fn active_autocomplete(s: &str) -> Option<(usize, char, String)> {
-    let idx = s.rfind(['@', '#'])?;
-    let kind = s[idx..].chars().next()?;
-    let after = &s[idx + 1..];
-    if after.len() > 32 || after.contains('\n') {
-        return None;
-    }
-    if !after
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
-    {
-        return None;
-    }
-    if idx > 0 {
-        let prev = s[..idx].chars().next_back().unwrap();
-        if !prev.is_whitespace() {
-            return None;
-        }
-    }
-    Some((idx, kind, after.to_string()))
-}
-
-fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
-    let img = image::RgbaImage::from_raw(width as u32, height as u32, rgba.to_vec())?;
-    let mut out = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut out, image::ImageFormat::Png)
-        .ok()?;
-    Some(out.into_inner())
-}
-
-fn is_image_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
-        .iter()
-        .any(|ext| lower.ends_with(ext))
-}
-
-/// Decode a Windows device-independent bitmap (the bytes of CF_DIB / CF_DIBV5)
-/// into top-down RGBA8. Supports 24- and 32-bpp uncompressed/bitfield data,
-/// which covers screenshots and most copied images.
-#[cfg(target_os = "windows")]
-fn dib_to_rgba(data: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
-    if data.len() < 40 {
-        return None;
-    }
-    let rd_u32 = |o: usize| -> Option<u32> {
-        data.get(o..o + 4)
-            .and_then(|s| s.try_into().ok())
-            .map(u32::from_le_bytes)
-    };
-    let rd_i32 = |o: usize| -> Option<i32> {
-        data.get(o..o + 4)
-            .and_then(|s| s.try_into().ok())
-            .map(i32::from_le_bytes)
-    };
-    let rd_u16 = |o: usize| -> Option<u16> {
-        data.get(o..o + 2)
-            .and_then(|s| s.try_into().ok())
-            .map(u16::from_le_bytes)
-    };
-    let bi_size = rd_u32(0)? as usize;
-    let width = rd_i32(4)?;
-    let height = rd_i32(8)?;
-    let bpp = rd_u16(14)?;
-    let compression = rd_u32(16)?;
-    let clr_used = rd_u32(32)? as usize;
-    if width <= 0 || height == 0 {
-        return None;
-    }
-    let w = width as usize;
-    let h = height.unsigned_abs() as usize;
-    let top_down = height < 0;
-    let mut offset = bi_size.max(40);
-    if bpp <= 8 {
-        let n = if clr_used != 0 {
-            clr_used
-        } else {
-            1usize << bpp
-        };
-        offset += n * 4;
-    }
-    if compression == 3 && bi_size == 40 {
-        offset += 12;
-    }
-    let mut rgba = vec![0u8; w * h * 4];
-    match bpp {
-        32 => {
-            let row = w * 4;
-            if data.len() < offset + row * h {
-                return None;
-            }
-            for y in 0..h {
-                let sy = if top_down { y } else { h - 1 - y };
-                let s = offset + sy * row;
-                let d = y * row;
-                for x in 0..w {
-                    let si = s + x * 4;
-                    let di = d + x * 4;
-                    rgba[di] = data[si + 2];
-                    rgba[di + 1] = data[si + 1];
-                    rgba[di + 2] = data[si];
-                    let a = data[si + 3];
-                    rgba[di + 3] = if compression == 0 && a == 0 { 255 } else { a };
-                }
-            }
-        }
-        24 => {
-            let row = (w * 3).div_ceil(4) * 4;
-            if data.len() < offset + row * h {
-                return None;
-            }
-            for y in 0..h {
-                let sy = if top_down { y } else { h - 1 - y };
-                let s = offset + sy * row;
-                let d = y * w * 4;
-                for x in 0..w {
-                    let si = s + x * 3;
-                    let di = d + x * 4;
-                    rgba[di] = data[si + 2];
-                    rgba[di + 1] = data[si + 1];
-                    rgba[di + 2] = data[si];
-                    rgba[di + 3] = 255;
-                }
-            }
-        }
-        _ => return None,
-    }
-    Some((w, h, rgba))
-}
-
-fn open_url(url: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn();
-    }
-}
-
-fn status_color(status: &str) -> egui::Color32 {
-    match status {
-        "online" => egui::Color32::from_rgb(59, 165, 93),
-        "idle" => egui::Color32::from_rgb(250, 166, 26),
-        "dnd" => egui::Color32::from_rgb(237, 66, 69),
-        _ => egui::Color32::from_rgb(128, 132, 142),
-    }
-}
-
-fn presence_rank(status: &str) -> u8 {
-    match status {
-        "online" => 0,
-        "idle" => 1,
-        "dnd" => 2,
-        _ => 3,
-    }
-}
-
-/// Draw a circular avatar with a presence ring around it (Discord-style).
-/// Returns the clickable response covering the avatar + ring.
-fn avatar_ring(
-    ui: &mut egui::Ui,
-    url: &str,
-    size: f32,
-    status: Option<&str>,
-) -> egui::Response {
-    let ring = (size * 0.09).clamp(2.0, 4.0);
-    let total = size + ring * 2.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(total, total), egui::Sense::click());
-    let center = rect.center();
-    if let Some(st) = status {
-        let color = if st == "offline" || st.is_empty() {
-            egui::Color32::from_gray(55)
-        } else {
-            status_color(st)
-        };
-        ui.painter()
-            .circle_stroke(center, size / 2.0 + ring * 0.6, egui::Stroke::new(ring, color));
-    }
-    let avatar_rect = egui::Rect::from_center_size(center, egui::vec2(size, size));
-    egui::Image::new(url)
-        .fit_to_exact_size(egui::vec2(size, size))
-        .corner_radius(size / 2.0)
-        .paint_at(ui, avatar_rect);
-    resp
-}
-
-fn badge(ui: &egui::Ui, rect: egui::Rect, count: u32, mention: bool) {
-    let painter = ui.painter();
-    let center = egui::pos2(rect.right() - 4.0, rect.top() + 6.0);
-    let color = if mention {
-        egui::Color32::from_rgb(237, 66, 69)
-    } else {
-        egui::Color32::from_rgb(88, 92, 100)
-    };
-    painter.circle_filled(center, 9.0, color);
-    let text = if count > 99 {
-        "99+".to_string()
-    } else {
-        count.to_string()
-    };
-    painter.text(
-        center,
-        egui::Align2::CENTER_CENTER,
-        text,
-        egui::FontId::proportional(11.0),
-        egui::Color32::WHITE,
-    );
 }
 
 fn radial_actions(m: &MenuCtx) -> Vec<RadAct> {
@@ -3885,7 +3723,7 @@ fn radial_hit(
         let step = tau / n as f32;
         let a0 = mi as f32 * step - std::f32::consts::FRAC_PI_2;
         // Outer fan band: sub-slices appended at the outer end of the More slice.
-        if len >= RADIAL_R_OUT && len <= RADIAL_R_OUT + RADIAL_SUB_BAND {
+        if (RADIAL_R_OUT..=RADIAL_R_OUT + RADIAL_SUB_BAND).contains(&len) {
             let d = (rel.y.atan2(rel.x) - a0).rem_euclid(tau);
             if d < step {
                 let m = submenu_actions().len();
@@ -4091,7 +3929,7 @@ fn radial_menu(
                     let a0 = mi as f32 * step - std::f32::consts::FRAC_PI_2;
                     let msubs = subs.len() as f32;
                     let steps = 12;
-                    for j in 0..subs.len() {
+                    for (j, _) in subs.iter().enumerate() {
                         let b0 = a0 + step * j as f32 / msubs;
                         let b1 = a0 + step * (j + 1) as f32 / msubs;
                         let fill = if sub == Some(j) {
@@ -4162,23 +4000,7 @@ fn radial_menu(
 }
 
 fn hold_stale(rs: &RenderState, msg_id: &str, sec_down: bool) -> bool {
-    match &rs.right_hold {
-        Some(h) if h.msg_id == msg_id && !sec_down => true,
-        _ => false,
-    }
-}
-
-/// Make menu entries flat (no grey button backgrounds), keeping a subtle hover
-/// highlight, matching the Discord context-menu look.
-fn flatten_menu(ui: &mut egui::Ui) {
-    let sel = ui.visuals().selection.bg_fill;
-    let w = &mut ui.style_mut().visuals.widgets;
-    w.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-    w.inactive.bg_stroke = egui::Stroke::NONE;
-    w.noninteractive.weak_bg_fill = egui::Color32::TRANSPARENT;
-    w.hovered.weak_bg_fill = sel.gamma_multiply(0.6);
-    w.hovered.bg_stroke = egui::Stroke::NONE;
-    w.active.weak_bg_fill = sel;
+    matches!(&rs.right_hold, Some(h) if h.msg_id == msg_id && !sec_down)
 }
 
 fn message_menu(ui: &mut egui::Ui, m: &MenuCtx, action: &mut Option<MsgAction>) {
@@ -4217,11 +4039,11 @@ fn message_menu(ui: &mut egui::Ui, m: &MenuCtx, action: &mut Option<MsgAction>) 
         }
     }
     ui.separator();
-    if !m.content.is_empty() {
-        if ui.button("Copy Text").clicked() {
-            ui.ctx().copy_text(m.content.clone());
-            ui.close();
-        }
+    if !m.content.is_empty()
+        && ui.button("Copy Text").clicked()
+    {
+        ui.ctx().copy_text(m.content.clone());
+        ui.close();
     }
     if ui.button("Copy Message ID").clicked() {
         ui.ctx().copy_text(m.message_id.clone());
@@ -4387,42 +4209,6 @@ fn play_notification_sound() {
 #[cfg(not(windows))]
 fn play_notification_sound() {}
 
-/// Compact window title bar: small title on the left, close button on the
-/// right. Returns `true` when the user clicked close.
-fn window_header(ui: &mut egui::Ui, title: &str) -> bool {
-    let mut close = false;
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(title).size(13.0).strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("x").clicked() {
-                close = true;
-            }
-        });
-    });
-    close
-}
-
-/// Discord-style reply indicator: a short accent bar followed by "author: preview".
-fn render_reply_line(ui: &mut egui::Ui, author: &str, preview: &str) -> egui::Response {
-    let resp = ui
-        .horizontal(|ui| {
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(3.0, 16.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, 1.5, egui::Color32::from_gray(120));
-            ui.add_space(4.0);
-            let text = if preview.is_empty() {
-                author.to_string()
-            } else {
-                format!("{author}: {preview}")
-            };
-            ui.weak(text);
-        })
-        .response;
-    resp.interact(egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
 fn render_reactions(ui: &mut egui::Ui, message: &Message, action: &mut Option<MsgAction>) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
@@ -4465,44 +4251,7 @@ fn render_reactions(ui: &mut egui::Ui, message: &Message, action: &mut Option<Ms
     });
 }
 
-/// Fit a (width, height) image into `max`, preserving aspect ratio.
-fn image_fit(w: u32, h: u32, max: egui::Vec2) -> egui::Vec2 {
-    let (w, h) = (w as f32, h as f32);
-    if w <= 0.0 || h <= 0.0 {
-        return egui::vec2(max.x.min(200.0), max.y.min(120.0));
-    }
-    let s = (max.x / w).min(max.y / h).min(1.0);
-    egui::vec2(w * s, h * s)
-}
-
 /// Extract a YouTube video id from a broadcast URL, when possible.
-fn youtube_id(url: &str) -> Option<String> {
-    if !(url.contains("youtube.com") || url.contains("youtu.be")) {
-        return None;
-    }
-    if let Some((_, rest)) = url.split_once("watch?v=") {
-        let id: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if id.len() == 11 {
-            return Some(id);
-        }
-    }
-    for marker in ["youtu.be/", "/shorts/", "/embed/"] {
-        if let Some((_, rest)) = url.split_once(marker) {
-            let id: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if id.len() == 11 {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
 fn render_attachment(
     ui: &mut egui::Ui,
     attachment: &Attachment,
@@ -4656,380 +4405,6 @@ fn render_embed(
 // Lightweight markdown / mention rendering
 // ---------------------------------------------------------------------------
 
-enum EmojiTok {
-    Unicode(String),
-    Custom(String),
-}
-
-fn is_emoji_char(c: char) -> bool {
-    let u = c as u32;
-    matches!(
-        u,
-        0x1F000..=0x1FAFF
-            | 0x2600..=0x27BF
-            | 0x2B00..=0x2BFF
-            | 0x2190..=0x21FF
-            | 0x2300..=0x23FF
-            | 0x2100..=0x214F
-            | 0x200D
-            | 0xFE0F
-            | 0x20E3
-    )
-}
-
-fn is_emoji_base(c: char) -> bool {
-    let u = c as u32;
-    is_emoji_char(c) && !matches!(u, 0xFE0F | 0x200D | 0x20E3)
-}
-
-fn is_regional_indicator(c: char) -> bool {
-    let u = c as u32;
-    (0x1F1E6..=0x1F1FF).contains(&u)
-}
-
-fn twemoji_url(s: &str) -> Option<String> {
-    if s.is_empty() {
-        return None;
-    }
-    let mut out = String::new();
-    for c in s.chars() {
-        let cp = c as u32;
-        if cp == 0xFE0F {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push('-');
-        }
-        out.push_str(&format!("{cp:x}"));
-    }
-    if out.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/{out}.png"
-    ))
-}
-
-enum EmojiPiece {
-    Text(String),
-    Emoji(String),
-}
-
-/// Split a string into runs of plain text and emoji sequences, so emoji can be
-/// rendered as Twemoji images rather than relying on a system emoji font.
-fn split_emoji(s: &str) -> Vec<EmojiPiece> {
-    let chars: Vec<char> = s.chars().collect();
-    let n = chars.len();
-    let mut out = Vec::new();
-    let mut text = String::new();
-    let mut i = 0;
-    while i < n {
-        let c = chars[i];
-        if is_regional_indicator(c) {
-            if !text.is_empty() {
-                out.push(EmojiPiece::Text(std::mem::take(&mut text)));
-            }
-            let mut e = String::new();
-            e.push(c);
-            i += 1;
-            if i < n && is_regional_indicator(chars[i]) {
-                e.push(chars[i]);
-                i += 1;
-            }
-            out.push(EmojiPiece::Emoji(e));
-        } else if is_emoji_base(c) {
-            if !text.is_empty() {
-                out.push(EmojiPiece::Text(std::mem::take(&mut text)));
-            }
-            let mut e = String::new();
-            e.push(c);
-            i += 1;
-            loop {
-                if i >= n {
-                    break;
-                }
-                let nxt = chars[i] as u32;
-                if nxt == 0x200D {
-                    e.push(chars[i]);
-                    i += 1;
-                    if i < n {
-                        e.push(chars[i]);
-                        i += 1;
-                    }
-                } else if matches!(nxt, 0xFE0F | 0x20E3 | 0x1F3FB..=0x1F3FF) {
-                    e.push(chars[i]);
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            out.push(EmojiPiece::Emoji(e));
-        } else {
-            text.push(c);
-            i += 1;
-        }
-    }
-    if !text.is_empty() {
-        out.push(EmojiPiece::Text(text));
-    }
-    out
-}
-
-fn render_plain(ui: &mut egui::Ui, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    for piece in split_emoji(text) {
-        match piece {
-            EmojiPiece::Text(t) => {
-                ui.label(t);
-            }
-            EmojiPiece::Emoji(e) => match twemoji_url(&e) {
-                Some(url) => {
-                    ui.add(
-                        egui::Image::new(&url)
-                            .fit_to_exact_size(egui::vec2(17.0, 17.0)),
-                    );
-                }
-                None => {
-                    ui.label(e);
-                }
-            },
-        }
-    }
-}
-
-fn emoji_button(ui: &mut egui::Ui, ch: &str, size: f32) -> egui::Response {
-    match twemoji_url(ch) {
-        Some(url) => ui.add(egui::Button::image(
-            egui::Image::new(&url).fit_to_exact_size(egui::vec2(size, size)),
-        )),
-        None => ui.add(egui::Button::new(ch)),
-    }
-}
-
-fn custom_emoji_in(tok: &str) -> Option<String> {
-    let inner = tok.strip_prefix('<')?.strip_suffix('>')?;
-    let (animated, body) = match inner.strip_prefix('a') {
-        Some(rest) if rest.starts_with(':') => (true, rest),
-        _ => (false, inner),
-    };
-    let body = body.strip_prefix(':')?;
-    let mut it = body.split(':');
-    let name = it.next()?;
-    let id = it.next()?;
-    if it.next().is_some() || name.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let ext = if animated { "gif" } else { "png" };
-    Some(format!("https://cdn.discordapp.com/emojis/{id}.{ext}"))
-}
-
-const EMOJIS: &[(&str, &str)] = &[
-    ("grinning", "\u{1F600}"),
-    ("smile", "\u{1F604}"),
-    ("smiley", "\u{1F603}"),
-    ("grin", "\u{1F601}"),
-    ("laughing", "\u{1F606}"),
-    ("sweat_smile", "\u{1F605}"),
-    ("joy", "\u{1F602}"),
-    ("rofl", "\u{1F923}"),
-    ("wink", "\u{1F609}"),
-    ("blush", "\u{1F60A}"),
-    ("slightly_smiling", "\u{1F642}"),
-    ("heart_eyes", "\u{1F60D}"),
-    ("kissing_heart", "\u{1F618}"),
-    ("thinking", "\u{1F914}"),
-    ("neutral_face", "\u{1F610}"),
-    ("expressionless", "\u{1F611}"),
-    ("smirk", "\u{1F60F}"),
-    ("unamused", "\u{1F612}"),
-    ("rolling_eyes", "\u{1F644}"),
-    ("flushed", "\u{1F633}"),
-    ("sob", "\u{1F62D}"),
-    ("cry", "\u{1F622}"),
-    ("scream", "\u{1F631}"),
-    ("rage", "\u{1F621}"),
-    ("angry", "\u{1F620}"),
-    ("sunglasses", "\u{1F60E}"),
-    ("nerd", "\u{1F913}"),
-    ("poop", "\u{1F4A9}"),
-    ("skull", "\u{1F480}"),
-    ("ghost", "\u{1F47B}"),
-    ("alien", "\u{1F47D}"),
-    ("robot", "\u{1F916}"),
-    ("clown", "\u{1F921}"),
-    ("thumbsup", "\u{1F44D}"),
-    ("thumbsdown", "\u{1F44E}"),
-    ("wave", "\u{1F44B}"),
-    ("clap", "\u{1F44F}"),
-    ("pray", "\u{1F64F}"),
-    ("ok_hand", "\u{1F44C}"),
-    ("muscle", "\u{1F4AA}"),
-    ("point_up", "\u{261D}\u{FE0F}"),
-    ("point_right", "\u{1F449}"),
-    ("point_left", "\u{1F448}"),
-    ("raised_hands", "\u{1F64C}"),
-    ("handshake", "\u{1F91D}"),
-    ("eyes", "\u{1F440}"),
-    ("eye", "\u{1F441}\u{FE0F}"),
-    ("fire", "\u{1F525}"),
-    ("star", "\u{2B50}"),
-    ("sparkles", "\u{2728}"),
-    ("boom", "\u{1F4A5}"),
-    ("zap", "\u{26A1}"),
-    ("heart", "\u{2764}\u{FE0F}"),
-    ("orange_heart", "\u{1F9E1}"),
-    ("yellow_heart", "\u{1F49B}"),
-    ("green_heart", "\u{1F49A}"),
-    ("blue_heart", "\u{1F499}"),
-    ("purple_heart", "\u{1F49C}"),
-    ("broken_heart", "\u{1F494}"),
-    ("100", "\u{1F4AF}"),
-    ("tada", "\u{1F389}"),
-    ("rocket", "\u{1F680}"),
-    ("check", "\u{2705}"),
-    ("x", "\u{274C}"),
-    ("warning", "\u{26A0}\u{FE0F}"),
-    ("question", "\u{2753}"),
-    ("exclamation", "\u{2757}"),
-    ("+1", "\u{1F44D}"),
-    ("-1", "\u{1F44E}"),
-    ("cat", "\u{1F431}"),
-    ("dog", "\u{1F436}"),
-    ("unicorn", "\u{1F984}"),
-    ("dragon", "\u{1F409}"),
-    ("pizza", "\u{1F355}"),
-    ("burger", "\u{1F354}"),
-    ("fries", "\u{1F35F}"),
-    ("beer", "\u{1F37A}"),
-    ("beers", "\u{1F37B}"),
-    ("coffee", "\u{2615}"),
-    ("cake", "\u{1F370}"),
-    ("cookie", "\u{1F36A}"),
-    ("apple", "\u{1F34E}"),
-    ("soccer", "\u{26BD}"),
-    ("basketball", "\u{1F3C0}"),
-    ("trophy", "\u{1F3C6}"),
-    ("medal", "\u{1F3C5}"),
-    ("dice", "\u{1F3B2}"),
-    ("crown", "\u{1F451}"),
-    ("gem", "\u{1F48E}"),
-    ("money", "\u{1F4B0}"),
-    ("gift", "\u{1F381}"),
-    ("bell", "\u{1F514}"),
-    ("mega", "\u{1F4E3}"),
-    ("book", "\u{1F4D6}"),
-    ("pencil", "\u{270F}\u{FE0F}"),
-    ("computer", "\u{1F4BB}"),
-    ("phone", "\u{1F4F1}"),
-    ("camera", "\u{1F4F7}"),
-    ("music", "\u{1F3B5}"),
-    ("headphones", "\u{1F3A7}"),
-    ("game", "\u{1F3AE}"),
-    ("sun", "\u{2600}\u{FE0F}"),
-    ("moon", "\u{1F319}"),
-    ("cloud", "\u{2601}\u{FE0F}"),
-    ("rain", "\u{1F327}\u{FE0F}"),
-    ("snowflake", "\u{2744}\u{FE0F}"),
-    ("100_points", "\u{1F4AF}"),
-    ("partying", "\u{1F973}"),
-    ("shrug", "\u{1F937}"),
-    ("facepalm", "\u{1F926}"),
-    ("salute", "\u{1FAE1}"),
-    ("melting", "\u{1FAE0}"),
-];
-
-fn shortcode(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "smile" => "\u{1F604}",
-        "smiley" => "\u{1F603}",
-        "grin" => "\u{1F601}",
-        "joy" => "\u{1F602}",
-        "rofl" => "\u{1F923}",
-        "wink" => "\u{1F609}",
-        "blush" => "\u{1F60A}",
-        "heart_eyes" => "\u{1F60D}",
-        "thinking" | "thinking_face" => "\u{1F914}",
-        "sob" | "cry" => "\u{1F62D}",
-        "sunglasses" => "\u{1F60E}",
-        "rage" | "angry" => "\u{1F621}",
-        "scream" => "\u{1F631}",
-        "thumbsup" | "+1" => "\u{1F44D}",
-        "thumbsdown" | "-1" => "\u{1F44E}",
-        "wave" => "\u{1F44B}",
-        "clap" => "\u{1F44F}",
-        "pray" => "\u{1F64F}",
-        "ok_hand" => "\u{1F44C}",
-        "eyes" => "\u{1F440}",
-        "fire" => "\u{1F525}",
-        "star" => "\u{2B50}",
-        "sparkles" => "\u{2728}",
-        "heart" => "\u{2764}\u{FE0F}",
-        "broken_heart" => "\u{1F494}",
-        "poop" | "shit" => "\u{1F4A9}",
-        "skull" => "\u{1F480}",
-        "tada" => "\u{1F389}",
-        "rocket" => "\u{1F680}",
-        "check" | "white_check_mark" => "\u{2705}",
-        "x" => "\u{274C}",
-        "100" => "\u{1F4AF}",
-        "cat" => "\u{1F431}",
-        "dog" => "\u{1F436}",
-        "pizza" => "\u{1F355}",
-        "beer" => "\u{1F37A}",
-        "coffee" => "\u{2615}",
-        _ => return None,
-    })
-}
-
-fn big_emoji(content: &str) -> Option<Vec<EmojiTok>> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() || trimmed.len() > 80 {
-        return None;
-    }
-    let mut tokens = Vec::new();
-    for tok in trimmed.split_whitespace() {
-        if let Some(url) = custom_emoji_in(tok) {
-            tokens.push(EmojiTok::Custom(url));
-            continue;
-        }
-        if tok.len() >= 3 && tok.starts_with(':') && tok.ends_with(':') {
-            let name = &tok[1..tok.len() - 1];
-            match shortcode(name) {
-                Some(u) => {
-                    tokens.push(EmojiTok::Unicode(u.to_string()));
-                    continue;
-                }
-                None => return None,
-            }
-        }
-        if tok.chars().all(is_emoji_char) {
-            tokens.push(EmojiTok::Unicode(tok.to_string()));
-            continue;
-        }
-        return None;
-    }
-    if tokens.is_empty() || tokens.len() > 3 {
-        return None;
-    }
-    Some(tokens)
-}
-
-#[derive(Clone)]
-enum Seg {
-    Plain(String),
-    Bold(String),
-    Italic(String),
-    Strike(String),
-    Code(String),
-    Spoiler(String),
-    Mention { text: String, me: bool },
-    Channel(String),
-    Emoji { name: String, id: String, animated: bool },
-    Url(String),
-}
-
 fn render_content(
     ui: &mut egui::Ui,
     content: &str,
@@ -5068,7 +4443,7 @@ fn render_content(
     let segs = match rs.seg_cache.get(msg_id) {
         Some((c, v)) if c == content => v.clone(),
         _ => {
-            let v = parse_segments(content, s);
+            let v = markdown::parse(content, s);
             rs.seg_cache
                 .insert(msg_id.to_string(), (content.to_string(), v.clone()));
             v
@@ -5187,7 +4562,7 @@ fn render_fenced(
             code.push_str(line);
             code.push('\n');
         } else if !line.is_empty() {
-            render_segments(ui, parse_segments(line, s), msg_id, rs);
+            render_segments(ui, markdown::parse(line, s), msg_id, rs);
         }
     }
     if in_code && !code.is_empty() {
@@ -5205,248 +4580,4 @@ fn render_code_block(ui: &mut egui::Ui, code: &str) {
         .wrap(),
     );
     ui.add_space(2.0);
-}
-
-fn parse_segments(text: &str, s: &SharedState) -> Vec<Seg> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut out: Vec<Seg> = Vec::new();
-    let mut buf = String::new();
-    let mut i = 0;
-
-    while i < n {
-        let c = chars[i];
-
-        if c == '`' {
-            if let Some(end) = find_char(&chars, i + 1, '`') {
-                push_plain(&mut buf, &mut out);
-                out.push(Seg::Code(chars[i + 1..end].iter().collect()));
-                i = end + 1;
-                continue;
-            }
-        }
-        if c == '*' && i + 1 < n && chars[i + 1] == '*' {
-            if let Some(end) = find_seq(&chars, i + 2, '*', '*') {
-                push_plain(&mut buf, &mut out);
-                out.push(Seg::Bold(chars[i + 2..end].iter().collect()));
-                i = end + 2;
-                continue;
-            }
-        }
-        if c == '~' && i + 1 < n && chars[i + 1] == '~' {
-            if let Some(end) = find_seq(&chars, i + 2, '~', '~') {
-                push_plain(&mut buf, &mut out);
-                out.push(Seg::Strike(chars[i + 2..end].iter().collect()));
-                i = end + 2;
-                continue;
-            }
-        }
-        if c == '|' && i + 1 < n && chars[i + 1] == '|' {
-            if let Some(end) = find_seq(&chars, i + 2, '|', '|') {
-                push_plain(&mut buf, &mut out);
-                out.push(Seg::Spoiler(chars[i + 2..end].iter().collect()));
-                i = end + 2;
-                continue;
-            }
-        }
-        if c == '*' || c == '_' {
-            // For `_`, only treat it as emphasis at a word boundary so that
-            // identifiers like snake_case are not mangled.
-            let boundary = c == '*'
-                || (i == 0 || !chars[i - 1].is_alphanumeric())
-                    && i + 1 < n
-                    && !chars[i + 1].is_whitespace();
-            if boundary {
-                if let Some(end) = find_char(&chars, i + 1, c) {
-                    if end > i + 1 && !chars[end - 1].is_whitespace() {
-                        push_plain(&mut buf, &mut out);
-                        out.push(Seg::Italic(chars[i + 1..end].iter().collect()));
-                        i = end + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-        if c == ':' {
-            if let Some(end) = find_char(&chars, i + 1, ':') {
-                if end > i + 1 && end - i <= 40 {
-                    let name: String = chars[i + 1..end].iter().collect();
-                    if name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '+' || c == '-')
-                    {
-                        if let Some(uni) = shortcode(&name) {
-                            push_plain(&mut buf, &mut out);
-                            out.push(Seg::Plain(uni.to_string()));
-                            i = end + 1;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-        if c == '@' && (i == 0 || !chars[i - 1].is_alphanumeric()) {
-            let word = if starts_word(&chars, i, "everyone") {
-                Some("everyone")
-            } else if starts_word(&chars, i, "here") {
-                Some("here")
-            } else {
-                None
-            };
-            if let Some(w) = word {
-                push_plain(&mut buf, &mut out);
-                out.push(Seg::Mention {
-                    text: format!("@{w}"),
-                    me: true,
-                });
-                i += 1 + w.len();
-                continue;
-            }
-        }
-        if c == '<' {
-            if let Some(end) = find_char(&chars, i + 1, '>') {
-                let inner: String = chars[i + 1..end].iter().collect();
-                if let Some(seg) = parse_angle(&inner, s) {
-                    push_plain(&mut buf, &mut out);
-                    out.push(seg);
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-        if c == 'h' && matches_http(&chars, i) {
-            let mut j = i;
-            while j < n && !chars[j].is_whitespace() {
-                j += 1;
-            }
-            let url: String = chars[i..j].iter().collect();
-            push_plain(&mut buf, &mut out);
-            out.push(Seg::Url(url));
-            i = j;
-            continue;
-        }
-
-        buf.push(c);
-        i += 1;
-    }
-
-    push_plain(&mut buf, &mut out);
-    out
-}
-
-fn parse_angle(inner: &str, s: &SharedState) -> Option<Seg> {
-    let is_me = |id: &str| s.me.as_ref().map(|u| u.id == id).unwrap_or(false);
-    if let Some(rest) = inner.strip_prefix("@!") {
-        if rest.chars().all(|c| c.is_ascii_digit()) {
-            let name = s.user_name(rest).unwrap_or_else(|| "user".to_string());
-            return Some(Seg::Mention {
-                text: format!("@{name}"),
-                me: is_me(rest),
-            });
-        }
-    }
-    if let Some(rest) = inner.strip_prefix('@') {
-        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-            let name = s.user_name(rest).unwrap_or_else(|| "user".to_string());
-            return Some(Seg::Mention {
-                text: format!("@{name}"),
-                me: is_me(rest),
-            });
-        }
-    }
-    if let Some(rest) = inner.strip_prefix("#") {
-        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-            let name = s.channel_name(rest).unwrap_or_else(|| "channel".to_string());
-            return Some(Seg::Channel(format!("#{name}")));
-        }
-    }
-    if let Some(rest) = inner.strip_prefix("@&") {
-        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-            return Some(Seg::Mention {
-                text: "@role".to_string(),
-                me: false,
-            });
-        }
-    }
-    // Custom emoji:  <:name:id>  or  <a:name:id>
-    let (animated, body) = match inner.strip_prefix('a') {
-        Some(rest) if rest.starts_with(':') => (true, rest),
-        _ => (false, inner),
-    };
-    if let Some(body) = body.strip_prefix(':') {
-        let parts: Vec<&str> = body.split(':').collect();
-        if parts.len() == 2 && !parts[1].is_empty() && parts[1].chars().all(|c| c.is_ascii_digit()) {
-            return Some(Seg::Emoji {
-                name: parts[0].to_string(),
-                id: parts[1].to_string(),
-                animated,
-            });
-        }
-    }
-    None
-}
-
-fn find_char(chars: &[char], from: usize, target: char) -> Option<usize> {
-    (from..chars.len()).find(|&j| chars[j] == target)
-}
-
-fn find_seq(chars: &[char], from: usize, a: char, b: char) -> Option<usize> {
-    (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == a && chars[j + 1] == b)
-}
-
-fn matches_http(chars: &[char], i: usize) -> bool {
-    let pat = ['h', 't', 't', 'p'];
-    chars.len() >= i + 4 && chars[i..i + 4] == pat
-}
-
-fn starts_word(chars: &[char], i: usize, word: &str) -> bool {
-    let w: Vec<char> = word.chars().collect();
-    let start = i + 1;
-    if start + w.len() > chars.len() {
-        return false;
-    }
-    for (k, &wc) in w.iter().enumerate() {
-        if chars[start + k] != wc {
-            return false;
-        }
-    }
-    match chars.get(start + w.len()) {
-        Some(&next) => !next.is_alphanumeric() && next != '_',
-        None => true,
-    }
-}
-
-fn push_plain(buf: &mut String, out: &mut Vec<Seg>) {
-    if !buf.is_empty() {
-        out.push(Seg::Plain(std::mem::take(buf)));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn parse_ts(timestamp: &Option<String>) -> Option<DateTime<Local>> {
-    timestamp
-        .as_ref()
-        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-        .map(|dt| dt.with_timezone(&Local))
-}
-
-#[allow(dead_code)]
-fn date_of(ts: Option<DateTime<Local>>) -> Option<NaiveDate> {
-    ts.map(|t| t.date_naive())
-}
-
-fn preview_text(content: &str) -> String {
-    let line = content.lines().next().unwrap_or("").trim();
-    if line.chars().count() > 80 {
-        let mut s: String = line.chars().take(80).collect();
-        s.push('…');
-        s
-    } else if line.is_empty() {
-        "[attachment]".to_string()
-    } else {
-        line.to_string()
-    }
 }

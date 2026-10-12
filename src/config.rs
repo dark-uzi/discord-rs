@@ -15,32 +15,49 @@ fn session_path() -> PathBuf {
     base.join("discord-rs").join("session.json")
 }
 
-/// Load a previously saved token, if any.
+/// Service name used for the token in the OS credential store (Windows
+/// Credential Manager). Keeps the session token out of plaintext files.
+const KEYRING_SERVICE: &str = "discord-rs";
+
+fn keyring_entry() -> Option<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, "session-token").ok()
+}
+
+/// Load a previously saved token, if any. Reads from the OS credential store;
+/// on a miss the legacy plaintext `session.json` is used and migrated.
 pub fn load_token() -> Option<String> {
+    if let Some(entry) = keyring_entry() {
+        if let Ok(tok) = entry.get_password() {
+            if !tok.trim().is_empty() {
+                let _ = std::fs::remove_file(session_path());
+                return Some(tok);
+            }
+        }
+    }
     let data = std::fs::read_to_string(session_path()).ok()?;
     let file: SessionFile = serde_json::from_str(&data).ok()?;
     if file.token.trim().is_empty() {
         None
     } else {
+        save_token(&file.token);
         Some(file.token)
     }
 }
 
-/// Persist the token so the user stays logged in across restarts.
+/// Persist the token in the OS credential store so the user stays logged in
+/// across restarts.
 pub fn save_token(token: &str) {
-    let path = session_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let file = SessionFile {
-        token: token.to_string(),
-    };
-    if let Ok(data) = serde_json::to_string_pretty(&file) {
-        let _ = std::fs::write(path, data);
+    if let Some(entry) = keyring_entry() {
+        if entry.set_password(token).is_ok() {
+            let _ = std::fs::remove_file(session_path());
+        }
     }
 }
 
 pub fn clear_token() {
+    if let Some(entry) = keyring_entry() {
+        let _ = entry.delete_credential();
+    }
     let _ = std::fs::remove_file(session_path());
 }
 
@@ -79,10 +96,16 @@ pub struct Settings {
     pub notification_sound: bool,
     #[serde(default)]
     pub performance_mode: bool,
+    #[serde(default = "default_scroll_speed")]
+    pub scroll_speed: f32,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_scroll_speed() -> f32 {
+    2.0
 }
 
 impl Default for Settings {
@@ -104,6 +127,7 @@ impl Default for Settings {
             notifications: true,
             notification_sound: true,
             performance_mode: false,
+            scroll_speed: 2.0,
         }
     }
 }

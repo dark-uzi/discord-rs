@@ -1,9 +1,12 @@
 mod app;
 mod config;
+mod format;
 mod gateway;
+mod markdown;
 mod model;
 mod rest;
 mod state;
+mod widgets;
 
 use std::sync::{Arc, Mutex};
 
@@ -36,11 +39,12 @@ fn main() -> eframe::Result<()> {
                         match result {
                             Ok(gateway::SessionEnd::Logout) => {
                                 config::clear_token();
-                                shared.lock().unwrap().reset();
+                                shared.lock().unwrap_or_else(|p| p.into_inner()).reset();
                             }
                             Ok(gateway::SessionEnd::Shutdown) => {}
                             Err(e) => {
-                                let mut s = shared.lock().unwrap();
+                                let mut s =
+                                    shared.lock().unwrap_or_else(|p| p.into_inner());
                                 if !matches!(s.status, ConnectionStatus::Error(_)) {
                                     s.status = ConnectionStatus::Error(e.to_string());
                                     s.last_error = Some(e.to_string());
@@ -75,7 +79,12 @@ fn main() -> eframe::Result<()> {
             // Append Segoe UI Emoji as a fallback so emoji glyphs (incl. ones
             // outside egui's built-in emoji subset) render instead of boxes.
             let mut fonts = egui::FontDefinitions::default();
-            if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\seguiemj.ttf") {
+            let segoe_path = std::env::var_os("WINDIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("C:\\Windows"))
+                .join("Fonts")
+                .join("seguiemj.ttf");
+            if let Ok(bytes) = std::fs::read(segoe_path) {
                 fonts
                     .font_data
                     .insert("segoe_emoji".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));

@@ -21,6 +21,7 @@ rfd = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4"
+keyring = { version = "3", features = ["windows-native"] }
 
 [profile.dev]
 opt-level = 1
