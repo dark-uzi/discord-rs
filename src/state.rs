@@ -1010,4 +1010,5 @@ fn collect_message_image_uris(message: &Message, out: &mut Vec<String>) {
             out.push(u);
         }
     }
+    crate::format::collect_content_image_uris(&message.content, out);
 }

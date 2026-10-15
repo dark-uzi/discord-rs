@@ -17,8 +17,10 @@ fn session_path() -> PathBuf {
 
 /// Service name used for the token in the OS credential store (Windows
 /// Credential Manager). Keeps the session token out of plaintext files.
+#[cfg(target_os = "windows")]
 const KEYRING_SERVICE: &str = "discord-rs";
 
+#[cfg(target_os = "windows")]
 fn keyring_entry() -> Option<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, "session-token").ok()
 }
@@ -26,6 +28,7 @@ fn keyring_entry() -> Option<keyring::Entry> {
 /// Load a previously saved token, if any. Reads from the OS credential store;
 /// on a miss the legacy plaintext `session.json` is used and migrated.
 pub fn load_token() -> Option<String> {
+    #[cfg(target_os = "windows")]
     if let Some(entry) = keyring_entry() {
         if let Ok(tok) = entry.get_password() {
             if !tok.trim().is_empty() {
@@ -47,14 +50,26 @@ pub fn load_token() -> Option<String> {
 /// Persist the token in the OS credential store so the user stays logged in
 /// across restarts.
 pub fn save_token(token: &str) {
+    #[cfg(target_os = "windows")]
     if let Some(entry) = keyring_entry() {
         if entry.set_password(token).is_ok() {
             let _ = std::fs::remove_file(session_path());
+            return;
         }
+    }
+    let path = session_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(data) = serde_json::to_string(&SessionFile {
+        token: token.to_string(),
+    }) {
+        let _ = std::fs::write(path, data);
     }
 }
 
 pub fn clear_token() {
+    #[cfg(target_os = "windows")]
     if let Some(entry) = keyring_entry() {
         let _ = entry.delete_credential();
     }
