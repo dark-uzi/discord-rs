@@ -389,19 +389,18 @@ impl App {
             return;
         }
         for f in dropped {
-            let path = f.path().to_path_buf();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file")
-                .to_string();
-            let data = if path.as_os_str().is_empty() {
-                f.bytes().ok()
+            let (name, data) = if let Some(path) = &f.path {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+                let data = std::fs::read(path).ok().or_else(|| f.bytes.as_ref().map(|b| b.to_vec()));
+                (name, data)
             } else {
-                match std::fs::read(&path) {
-                    Ok(d) => Some(d),
-                    Err(_) => f.bytes().ok(),
-                }
+                let name = f.name.clone();
+                let data = f.bytes.as_ref().map(|b| b.to_vec());
+                (name, data)
             };
             if let Some(data) = data {
                 self.pending_files
@@ -2293,6 +2292,11 @@ impl App {
             self.anchor_channel = Some(channel_id.clone());
             self.render.rects.clear();
             self.render.seg_cache.clear();
+        } else if self.render.seg_cache.len() > 500 {
+            self.render.seg_cache.clear();
+        }
+        if self.render.rects.len() > 500 {
+            self.render.rects.clear();
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -2999,11 +3003,19 @@ impl App {
         ) {
             return true;
         }
-        if !s.loading_older.is_empty() {
+        let Some(sel_chan) = s.selected_channel.as_ref() else {
+            return false;
+        };
+        if s.loading_older.contains(sel_chan) {
             return true;
         }
         let now = std::time::Instant::now();
-        s.typing.iter().any(|(_, v)| v.iter().any(|t| t.until > now))
+        if let Some(v) = s.typing.get(sel_chan) {
+            if v.iter().any(|t| t.until > now) {
+                return true;
+            }
+        }
+        false
     }
 }
 

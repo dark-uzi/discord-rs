@@ -385,6 +385,32 @@ pub(crate) fn date_of(ts: Option<DateTime<Local>>) -> Option<NaiveDate> {
     ts.map(|t| t.date_naive())
 }
 
+pub(crate) fn collect_content_image_uris(content: &str, out: &mut Vec<String>) {
+    if content.is_empty() {
+        return;
+    }
+    for piece in split_emoji(content) {
+        if let EmojiPiece::Emoji(e) = piece {
+            if let Some(url) = twemoji_url(&e) {
+                out.push(url);
+            }
+        }
+    }
+    let mut rest = content;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start..];
+        if let Some(end) = rest.find('>') {
+            let tok = &rest[..=end];
+            if let Some(url) = custom_emoji_in(tok) {
+                out.push(url);
+            }
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+}
+
 pub(crate) fn preview_text(content: &str) -> String {
     let line = content.lines().next().unwrap_or("").trim();
     if line.chars().count() > 80 {

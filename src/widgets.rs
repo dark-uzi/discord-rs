@@ -148,6 +148,10 @@ pub(crate) fn dib_to_rgba(data: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
             if data.len() < offset + row * h {
                 return None;
             }
+            let has_alpha = (0..h).any(|y| {
+                let s = offset + y * row;
+                (0..w).any(|x| data[s + x * 4 + 3] != 0)
+            });
             for y in 0..h {
                 let sy = if top_down { y } else { h - 1 - y };
                 let s = offset + sy * row;
@@ -159,7 +163,7 @@ pub(crate) fn dib_to_rgba(data: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
                     rgba[di + 1] = data[si + 1];
                     rgba[di + 2] = data[si];
                     let a = data[si + 3];
-                    rgba[di + 3] = if compression == 0 && a == 0 { 255 } else { a };
+                    rgba[di + 3] = if !has_alpha { 255 } else { a };
                 }
             }
         }
