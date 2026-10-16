@@ -72,16 +72,13 @@ pub(crate) fn badge(ui: &egui::Ui, rect: egui::Rect, count: u32, mention: bool) 
     );
 }
 
+pub(crate) fn is_safe_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
 pub(crate) fn open_url(url: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = url;
+    if is_safe_url(url) {
+        let _ = webbrowser::open(url);
     }
 }
 
@@ -280,5 +277,20 @@ pub(crate) fn emoji_button(ui: &mut egui::Ui, ch: &str, size: f32) -> egui::Resp
             egui::Image::new(&url).fit_to_exact_size(egui::vec2(size, size)),
         )),
         None => ui.add(egui::Button::new(ch)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_url() {
+        assert!(is_safe_url("https://discord.com"));
+        assert!(is_safe_url("http://example.com/test"));
+        assert!(!is_safe_url("file:///C:/Windows/System32/cmd.exe"));
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("calc.exe"));
+        assert!(!is_safe_url("ftp://example.com"));
     }
 }
