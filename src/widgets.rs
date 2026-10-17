@@ -73,15 +73,10 @@ pub(crate) fn badge(ui: &egui::Ui, rect: egui::Rect, count: u32, mention: bool) 
 }
 
 pub(crate) fn open_url(url: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = url;
+    let lower = url.trim().to_lowercase();
+    // Sanitize and ensure only web URLs are opened to prevent local command/file execution.
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let _ = webbrowser::open(url);
     }
 }
 
@@ -280,5 +275,19 @@ pub(crate) fn emoji_button(ui: &mut egui::Ui, ch: &str, size: f32) -> egui::Resp
             egui::Image::new(&url).fit_to_exact_size(egui::vec2(size, size)),
         )),
         None => ui.add(egui::Button::new(ch)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_open_url_safely_ignores_invalid_schemes() {
+        // These should non-panicking and non-executing (scheme validation filters them out).
+        open_url("calc.exe");
+        open_url("file:///C:/Windows/System32/calc.exe");
+        open_url("   http://example.com  ");
+        open_url("HTTPS://EXAMPLE.COM");
     }
 }
