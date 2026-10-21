@@ -9,7 +9,7 @@ use crate::format::{active_autocomplete, active_shortcode, big_emoji, is_image_p
 use crate::markdown::{self, Seg};
 use crate::model::{Attachment, Embed, Emoji, Member, Message, User};
 use crate::state::{Command, ConnectionStatus, LogEntry, LogKind, PendingFile, SharedState, DM_HOME};
-use crate::widgets::{avatar_ring, badge, emoji_button, encode_png, flatten_menu, image_fit, open_url, presence_rank, render_plain, render_reply_line, window_header};
+use crate::widgets::{avatar_ring, badge, emoji_button, encode_png, flatten_menu, image_fit, open_url, presence_rank, render_plain, render_reply_line, safe_hyperlink_to, window_header};
 
 #[cfg(target_os = "windows")]
 use crate::widgets::dib_to_rgba;
@@ -4307,7 +4307,7 @@ fn render_attachment(
             }
         }
     } else if let Some(url) = &attachment.url {
-        ui.hyperlink_to(format!("\u{1F4CE} {}", attachment.filename), url);
+        safe_hyperlink_to(ui, format!("\u{1F4CE} {}", attachment.filename), url);
     } else {
         ui.weak(format!("\u{1F4CE} {}", attachment.filename));
     }
@@ -4323,7 +4323,7 @@ fn render_embed(
         ui.set_max_width(440.0);
         if let Some(title) = &embed.title {
             if let Some(url) = &embed.url {
-                ui.hyperlink_to(RichText::new(title).strong(), url);
+                safe_hyperlink_to(ui, RichText::new(title).strong(), url);
             } else {
                 ui.label(RichText::new(title).strong());
             }
@@ -4407,7 +4407,7 @@ fn render_embed(
         }
         if let Some(v) = &embed.video {
             if let Some(u) = &v.url {
-                ui.hyperlink_to("Watch", u);
+                safe_hyperlink_to(ui, "Watch", u);
             }
         }
     });
@@ -4545,7 +4545,7 @@ fn render_segments(
                     let _ = name;
                 }
                 Seg::Url(u) => {
-                    ui.hyperlink_to(u.clone(), u.clone());
+                    safe_hyperlink_to(ui, u.clone(), &u);
                 }
             }
         }

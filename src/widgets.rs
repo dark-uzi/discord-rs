@@ -76,6 +76,18 @@ pub(crate) fn is_safe_url(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
 }
 
+pub(crate) fn safe_hyperlink_to(
+    ui: &mut egui::Ui,
+    text: impl Into<egui::WidgetText>,
+    url: &str,
+) -> egui::Response {
+    if is_safe_url(url) {
+        ui.hyperlink_to(text, url)
+    } else {
+        ui.label(text)
+    }
+}
+
 pub(crate) fn open_url(url: &str) {
     if is_safe_url(url) {
         let _ = webbrowser::open(url);
@@ -290,7 +302,9 @@ mod tests {
         assert!(is_safe_url("http://example.com/test"));
         assert!(!is_safe_url("file:///C:/Windows/System32/cmd.exe"));
         assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("data:text/html,<script>alert(1)</script>"));
         assert!(!is_safe_url("calc.exe"));
+        assert!(!is_safe_url("custom://action"));
         assert!(!is_safe_url("ftp://example.com"));
     }
 }
