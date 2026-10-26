@@ -82,6 +82,18 @@ pub(crate) fn open_url(url: &str) {
     }
 }
 
+pub(crate) fn safe_hyperlink_to(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    url: &str,
+) -> egui::Response {
+    if is_safe_url(url) {
+        ui.hyperlink_to(label, url)
+    } else {
+        ui.add_enabled(false, egui::Label::new(label))
+    }
+}
+
 pub(crate) fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
     let img = image::RgbaImage::from_raw(width as u32, height as u32, rgba.to_vec())?;
     let mut out = std::io::Cursor::new(Vec::new());
@@ -292,5 +304,6 @@ mod tests {
         assert!(!is_safe_url("javascript:alert(1)"));
         assert!(!is_safe_url("calc.exe"));
         assert!(!is_safe_url("ftp://example.com"));
+        assert!(!is_safe_url("cmd.exe /c calc"));
     }
 }
