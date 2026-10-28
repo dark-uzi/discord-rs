@@ -73,7 +73,11 @@ pub(crate) fn badge(ui: &egui::Ui, rect: egui::Rect, count: u32, mention: bool) 
 }
 
 pub(crate) fn is_safe_url(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
+    let trimmed = url.trim();
+    trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("HTTP://")
+        || trimmed.starts_with("HTTPS://")
 }
 
 pub(crate) fn open_url(url: &str) {
@@ -288,6 +292,7 @@ mod tests {
     fn test_is_safe_url() {
         assert!(is_safe_url("https://discord.com"));
         assert!(is_safe_url("http://example.com/test"));
+        assert!(is_safe_url("  HTTPS://DISCORD.COM  "));
         assert!(!is_safe_url("file:///C:/Windows/System32/cmd.exe"));
         assert!(!is_safe_url("javascript:alert(1)"));
         assert!(!is_safe_url("calc.exe"));
