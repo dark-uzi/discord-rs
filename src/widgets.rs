@@ -74,10 +74,28 @@ pub(crate) fn badge(ui: &egui::Ui, rect: egui::Rect, count: u32, mention: bool) 
 
 pub(crate) fn is_safe_url(url: &str) -> bool {
     let trimmed = url.trim();
-    trimmed.starts_with("http://")
-        || trimmed.starts_with("https://")
-        || trimmed.starts_with("HTTP://")
-        || trimmed.starts_with("HTTPS://")
+    // Security: Only allow http:// or https:// schemes.
+    // Ensure the URL contains no whitespace or control characters that could trigger
+    // command injection, argument injection, or URL parsing discrepancies in OS handlers.
+    let rest = if let Some(r) = trimmed.strip_prefix("https://") {
+        r
+    } else if let Some(r) = trimmed.strip_prefix("http://") {
+        r
+    } else if let Some(r) = trimmed.strip_prefix("HTTPS://") {
+        r
+    } else if let Some(r) = trimmed.strip_prefix("HTTP://") {
+        r
+    } else {
+        return false;
+    };
+
+    // Ensure there is a non-empty host authority before any path/query/fragment separator.
+    let host = rest.split(&['/', '?', '#'][..]).next().unwrap_or("");
+    if host.is_empty() {
+        return false;
+    }
+
+    !trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 pub(crate) fn open_url(url: &str) {
@@ -293,9 +311,21 @@ mod tests {
         assert!(is_safe_url("https://discord.com"));
         assert!(is_safe_url("http://example.com/test"));
         assert!(is_safe_url("  HTTPS://DISCORD.COM  "));
+        assert!(is_safe_url("http://localhost:8080/path?query=1#frag"));
         assert!(!is_safe_url("file:///C:/Windows/System32/cmd.exe"));
         assert!(!is_safe_url("javascript:alert(1)"));
         assert!(!is_safe_url("calc.exe"));
         assert!(!is_safe_url("ftp://example.com"));
+        // Empty authority / host checks
+        assert!(!is_safe_url("http://"));
+        assert!(!is_safe_url("https://"));
+        assert!(!is_safe_url("http:///test"));
+        assert!(!is_safe_url("https:///"));
+        // Scheme or syntax anomalies
+        assert!(!is_safe_url("https:evil.com"));
+        // Control characters or unencoded whitespace
+        assert!(!is_safe_url("https://evil.com\r\ncalc.exe"));
+        assert!(!is_safe_url("https://evil.com\0calc.exe"));
+        assert!(!is_safe_url("https://evil.com/a b"));
     }
 }
