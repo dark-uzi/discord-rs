@@ -8,11 +8,20 @@ struct SessionFile {
     token: String,
 }
 
+fn app_dir() -> PathBuf {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        PathBuf::from(appdata).join("discord-rs")
+    } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(xdg).join("discord-rs")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".config").join("discord-rs")
+    } else {
+        std::env::temp_dir().join("discord-rs")
+    }
+}
+
 fn session_path() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("discord-rs").join("session.json")
+    app_dir().join("session.json")
 }
 
 /// Service name used for the token in the OS credential store (Windows
@@ -148,10 +157,7 @@ impl Default for Settings {
 }
 
 fn settings_path() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("discord-rs").join("settings.json")
+    app_dir().join("settings.json")
 }
 
 pub fn load_settings() -> Settings {
@@ -171,11 +177,19 @@ pub fn save_settings(settings: &Settings) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_dir_path_structure() {
+        let dir = app_dir();
+        assert!(dir.ends_with("discord-rs"));
+    }
+}
+
 fn aliases_path() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("discord-rs").join("aliases.json")
+    app_dir().join("aliases.json")
 }
 
 pub fn load_aliases() -> HashMap<String, String> {
@@ -204,10 +218,7 @@ pub struct Pins {
 }
 
 fn pins_path() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("discord-rs").join("pins.json")
+    app_dir().join("pins.json")
 }
 
 pub fn load_pins() -> Pins {
