@@ -14,6 +14,13 @@ use crate::widgets::{avatar_ring, badge, emoji_button, encode_png, flatten_menu,
 #[cfg(target_os = "windows")]
 use crate::widgets::dib_to_rgba;
 
+#[derive(Clone, Copy, PartialEq)]
+enum FriendsTab {
+    All,
+    Pending,
+    Add,
+}
+
 struct ReplyTarget {
     channel_id: String,
     message_id: String,
@@ -121,6 +128,8 @@ pub struct App {
     pins_open: bool,
     log_open: bool,
     friends_open: bool,
+    friends_tab: FriendsTab,
+    friend_add_input: String,
     render: RenderState,
     member_search: String,
     switcher_open: bool,
@@ -203,6 +212,8 @@ impl App {
             pins_open: false,
             log_open: false,
             friends_open: false,
+            friends_tab: FriendsTab::All,
+            friend_add_input: String::new(),
             render: RenderState::default(),
             member_search: String::new(),
             switcher_open: false,
@@ -443,6 +454,15 @@ impl App {
         }
         if let Some(cid) = resolve {
             let _ = self.cmd_tx.send(Command::OpenChannel(cid));
+        }
+        let current_guild = self.shared.lock().unwrap_or_else(|p| p.into_inner()).selected_guild.clone();
+        if let Some(gid) = current_guild {
+            if gid != DM_HOME {
+                let _ = self.cmd_tx.send(Command::SubscribeChannel {
+                    guild_id: gid,
+                    channel_id: channel_id.to_string(),
+                });
+            }
         }
         let _ = self.cmd_tx.send(Command::AckChannel(channel_id.to_string()));
         let _ = self.cmd_tx.send(Command::FetchMessages(channel_id.to_string()));
@@ -930,9 +950,15 @@ impl App {
         if let Some((guild_id, channel_id)) = chosen {
             {
                 let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
-                s.selected_guild = Some(guild_id);
+                s.selected_guild = Some(guild_id.clone());
                 s.selected_channel = Some(channel_id.clone());
                 s.clear_unread(&channel_id);
+            }
+            if guild_id != DM_HOME {
+                let _ = self.cmd_tx.send(Command::SubscribeChannel {
+                    guild_id,
+                    channel_id: channel_id.clone(),
+                });
             }
             let _ = self.cmd_tx.send(Command::AckChannel(channel_id.clone()));
             let _ = self.cmd_tx.send(Command::FetchMessages(channel_id));
@@ -1976,8 +2002,13 @@ impl App {
         let friends_open = self.friends_open;
         let show_avatars = self.settings.dm_avatars;
         let use_names = self.settings.use_names;
+        let mut accept_req: Option<String> = None;
+        let mut remove_rel: Option<String> = None;
+        let mut send_req: Option<String> = None;
+
+        let panel_width = if friends_open { 240.0 } else { 200.0 };
         egui::Panel::left("channel_list")
-            .exact_size(200.0)
+            .exact_size(panel_width)
             .resizable(false)
             .show(ui, |ui| {
                 let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
@@ -2017,53 +2048,141 @@ impl App {
                     });
                     ui.separator();
                     if friends_open {
-                        let mut friends: Vec<&crate::model::Relationship> =
-                            s.friends.iter().filter(|r| r.kind == 1).collect();
-                        friends.sort_by(|a, b| {
-                            let oa = presence_rank(s.friend_presence(&a.user.id));
-                            let ob = presence_rank(s.friend_presence(&b.user.id));
-                            oa.cmp(&ob)
-                                .then_with(|| a.user.display_name().cmp(&b.user.display_name()))
+                        let pending_count = s.friends.iter().filter(|r| r.kind == 3 || r.kind == 4).count();
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(self.friends_tab == FriendsTab::All, "All").clicked() {
+                                self.friends_tab = FriendsTab::All;
+                            }
+                            let pend_text = if pending_count > 0 {
+                                format!("Pending ({pending_count})")
+                            } else {
+                                "Pending".to_string()
+                            };
+                            if ui.selectable_label(self.friends_tab == FriendsTab::Pending, pend_text).clicked() {
+                                self.friends_tab = FriendsTab::Pending;
+                            }
+                            if ui.selectable_label(self.friends_tab == FriendsTab::Add, "+ Add").clicked() {
+                                self.friends_tab = FriendsTab::Add;
+                            }
                         });
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                if friends.is_empty() {
-                                    ui.weak("No friends loaded.");
-                                }
-                                for rel in &friends {
-                                    let u = &rel.user;
-                                    let status = s.friend_presence(&u.id);
-                                    let name = if use_names {
-                                        u.username.clone()
-                                    } else {
-                                        s.name_in(DM_HOME, u)
-                                    };
-                                    let label = format!("{} \u{2014} {}", name, status);
-                                    let mut hit = false;
-                                    let resp = ui.horizontal(|ui| {
-                                        if show_avatars
-                                            && avatar_ring(
-                                                ui,
-                                                &u.avatar_url(64),
-                                                24.0,
-                                                Some(status),
-                                            )
-                                            .clicked()
-                                        {
-                                            hit = true;
+                        ui.separator();
+
+                        match self.friends_tab {
+                            FriendsTab::All => {
+                                let mut friends: Vec<&crate::model::Relationship> =
+                                    s.friends.iter().filter(|r| r.kind == 1).collect();
+                                friends.sort_by(|a, b| {
+                                    let oa = presence_rank(s.friend_presence(&a.user.id));
+                                    let ob = presence_rank(s.friend_presence(&b.user.id));
+                                    oa.cmp(&ob)
+                                        .then_with(|| a.user.display_name().cmp(&b.user.display_name()))
+                                });
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        if friends.is_empty() {
+                                            ui.weak("No friends loaded.");
                                         }
-                                        if ui.selectable_label(false, name.clone()).clicked() {
-                                            hit = true;
+                                        for rel in &friends {
+                                            let u = &rel.user;
+                                            let status = s.friend_presence(&u.id);
+                                            let name = if use_names {
+                                                u.username.clone()
+                                            } else {
+                                                s.name_in(DM_HOME, u)
+                                            };
+                                            let label = format!("{} \u{2014} {}", name, status);
+                                            let mut hit = false;
+                                            let resp = ui.horizontal(|ui| {
+                                                if show_avatars
+                                                    && avatar_ring(
+                                                        ui,
+                                                        &u.avatar_url(64),
+                                                        24.0,
+                                                        Some(status),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    hit = true;
+                                                }
+                                                if ui.selectable_label(false, name.clone()).clicked() {
+                                                    hit = true;
+                                                }
+                                            });
+                                            if hit {
+                                                friend_dm = Some(u.id.clone());
+                                            }
+                                            let uid = u.id.clone();
+                                            resp.response.context_menu(|ui| {
+                                                if ui.button("Remove Friend").clicked() {
+                                                    remove_rel = Some(uid);
+                                                    ui.close();
+                                                }
+                                            });
+                                            resp.response.on_hover_text(&label);
+                                            ui.add_space(2.0);
                                         }
                                     });
-                                    if hit {
-                                        friend_dm = Some(u.id.clone());
-                                    }
-                                    resp.response.on_hover_text(&label);
-                                    ui.add_space(2.0);
+                            }
+                            FriendsTab::Pending => {
+                                let pending: Vec<&crate::model::Relationship> =
+                                    s.friends.iter().filter(|r| r.kind == 3 || r.kind == 4).collect();
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        if pending.is_empty() {
+                                            ui.weak("No pending requests.");
+                                        }
+                                        for rel in &pending {
+                                            let u = &rel.user;
+                                            let is_incoming = rel.kind == 3;
+                                            ui.group(|ui| {
+                                                ui.horizontal(|ui| {
+                                                    if show_avatars {
+                                                        avatar_ring(ui, &u.avatar_url(64), 22.0, None);
+                                                    }
+                                                    ui.vertical(|ui| {
+                                                        ui.label(RichText::new(u.display_name()).strong());
+                                                        ui.weak(if is_incoming { "Incoming Request" } else { "Outgoing Request" });
+                                                    });
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    if is_incoming {
+                                                        if ui.small_button("\u{2714} Accept").clicked() {
+                                                            accept_req = Some(u.id.clone());
+                                                        }
+                                                        if ui.small_button("\u{2715} Ignore").clicked() {
+                                                            remove_rel = Some(u.id.clone());
+                                                        }
+                                                    } else {
+                                                        if ui.small_button("\u{2715} Cancel").clicked() {
+                                                            remove_rel = Some(u.id.clone());
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                            ui.add_space(2.0);
+                                        }
+                                    });
+                            }
+                            FriendsTab::Add => {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("Add Friend").strong());
+                                ui.weak("Enter username or username#1234");
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.friend_add_input)
+                                        .hint_text("Username")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if (ui.button("Send Request").clicked() || (resp.lost_focus() && enter))
+                                    && !self.friend_add_input.trim().is_empty()
+                                {
+                                    send_req = Some(self.friend_add_input.trim().to_string());
+                                    self.friend_add_input.clear();
                                 }
-                            });
+                            }
+                        }
                         return;
                     }
                     let mut channels = s.dm_channels();
@@ -2250,6 +2369,15 @@ impl App {
             self.friends_open = false;
             let _ = self.cmd_tx.send(Command::OpenDm(user_id));
         }
+        if let Some(user_id) = accept_req {
+            let _ = self.cmd_tx.send(Command::AcceptFriendRequest(user_id));
+        }
+        if let Some(user_id) = remove_rel {
+            let _ = self.cmd_tx.send(Command::RemoveFriend(user_id));
+        }
+        if let Some(username) = send_req {
+            let _ = self.cmd_tx.send(Command::SendFriendRequest(username));
+        }
     }
 
     fn message_view(&mut self, ui: &mut egui::Ui) {
@@ -2268,7 +2396,15 @@ impl App {
         let name = s
             .channels
             .get(&channel_id)
-            .map(|c| if c.is_dm() { c.dm_display_name() } else { format!("# {}", c.display_name()) })
+            .map(|c| {
+                if c.is_dm() {
+                    c.dm_display_name()
+                } else if c.is_thread() {
+                    format!("\u{1F4AC} {}", c.display_name())
+                } else {
+                    format!("# {}", c.display_name())
+                }
+            })
             .unwrap_or_else(|| "channel".to_string());
 
         let loading = s.loading_older.contains(&channel_id);
@@ -2955,7 +3091,7 @@ impl App {
             return;
         }
         let mut fetch_channels: Option<String> = None;
-        let mut fetch_messages: Option<String> = None;
+        let mut fetch_messages: Option<(String, String)> = None;
         {
             let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
             if !matches!(s.status, ConnectionStatus::Connected) || s.guilds.is_empty() {
@@ -2976,7 +3112,7 @@ impl App {
                 if s.selected_channel.is_none() {
                     if let Some(channel) = s.text_channels(&guild_id).into_iter().next() {
                         s.selected_channel = Some(channel.id.clone());
-                        fetch_messages = Some(channel.id);
+                        fetch_messages = Some((guild_id.clone(), channel.id));
                     }
                 }
                 self.auto_selected = true;
@@ -2985,7 +3121,11 @@ impl App {
         if let Some(id) = fetch_channels {
             let _ = self.cmd_tx.send(Command::FetchGuildChannels(id));
         }
-        if let Some(id) = fetch_messages {
+        if let Some((gid, id)) = fetch_messages {
+            let _ = self.cmd_tx.send(Command::SubscribeChannel {
+                guild_id: gid,
+                channel_id: id.clone(),
+            });
             let _ = self.cmd_tx.send(Command::FetchMessages(id));
         }
     }
@@ -3644,6 +3784,12 @@ fn render_channel_rows(
     clicked: &mut Option<String>,
     mark_read: &mut Option<String>,
 ) {
+    let threads = if let Some(gid) = s.selected_guild.as_ref() {
+        s.threads(gid)
+    } else {
+        Vec::new()
+    };
+
     for channel in channels {
         let selected = s.selected_channel.as_deref() == Some(channel.id.as_str());
         let unread = s.channel_unread(&channel.id);
@@ -3674,6 +3820,25 @@ fn render_channel_rows(
                 ui.close();
             }
         });
+
+        // Child threads belonging to this channel
+        let channel_threads: Vec<&crate::model::Channel> = threads
+            .iter()
+            .filter(|t| t.parent_id.as_deref() == Some(channel.id.as_str()))
+            .collect();
+        for th in channel_threads {
+            let th_sel = s.selected_channel.as_deref() == Some(th.id.as_str());
+            let th_unread = s.channel_unread(&th.id);
+            let th_mention = s.channel_mentions(&th.id) > 0;
+            let th_label = RichText::new(format!("  \u{2514} \u{1F4AC} {}", th.display_name())).size(12.0);
+            let th_resp = ui.selectable_label(th_sel, if th_unread > 0 { th_label.strong() } else { th_label });
+            if th_unread > 0 {
+                badge(ui, th_resp.rect, th_unread, th_mention);
+            }
+            if th_resp.clicked() {
+                *clicked = Some(th.id.clone());
+            }
+        }
     }
 }
 
@@ -4319,98 +4484,165 @@ fn render_embed(
     load_images: bool,
     open_image: &mut Option<String>,
 ) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_max_width(440.0);
-        if let Some(title) = &embed.title {
-            if let Some(url) = &embed.url {
-                ui.hyperlink_to(RichText::new(title).strong(), url);
-            } else {
-                ui.label(RichText::new(title).strong());
+    let stroke_color = embed.color.map(|c| {
+        let r = ((c >> 16) & 0xFF) as u8;
+        let g = ((c >> 8) & 0xFF) as u8;
+        let b = (c & 0xFF) as u8;
+        egui::Color32::from_rgb(r, g, b)
+    }).unwrap_or_else(|| egui::Color32::from_gray(80));
+
+    egui::Frame::group(ui.style())
+        .stroke(egui::Stroke::new(1.5, stroke_color))
+        .show(ui, |ui| {
+            ui.set_max_width(460.0);
+
+            // Provider or Author
+            if let Some(author) = &embed.author {
+                ui.horizontal(|ui| {
+                    if load_images {
+                        if let Some(icon) = &author.icon_url {
+                            if !icon.is_empty() {
+                                ui.add(
+                                    egui::Image::new(icon)
+                                        .fit_to_exact_size(egui::vec2(16.0, 16.0))
+                                        .corner_radius(8.0),
+                                );
+                            }
+                        }
+                    }
+                    if let Some(url) = &author.url {
+                        ui.hyperlink_to(RichText::new(&author.name).small().strong(), url);
+                    } else {
+                        ui.label(RichText::new(&author.name).small().strong());
+                    }
+                });
+            } else if let Some(provider) = &embed.provider {
+                if let Some(pname) = &provider.name {
+                    ui.weak(pname);
+                }
             }
-        }
-        if let Some(desc) = &embed.description {
-            if !desc.is_empty() {
-                ui.label(desc);
+
+            if let Some(title) = &embed.title {
+                if let Some(url) = &embed.url {
+                    ui.hyperlink_to(RichText::new(title).strong().size(14.0), url);
+                } else {
+                    ui.label(RichText::new(title).strong().size(14.0));
+                }
             }
-        }
-        if let Some(img) = &embed.image {
-            if let Some(url) = img.best_url() {
-                if load_images {
-                    let sz = match (img.width, img.height) {
-                        (Some(w), Some(h)) => image_fit(w, h, egui::vec2(420.0, 300.0)),
-                        _ => egui::vec2(320.0, 220.0),
-                    };
-                    let resp = ui.add(
-                        egui::Image::new(&url)
-                            .fit_to_exact_size(sz)
-                            .corner_radius(6.0)
-                            .sense(egui::Sense::click()),
-                    );
-                    if resp.clicked() {
+
+            if let Some(desc) = &embed.description {
+                if !desc.is_empty() {
+                    ui.label(desc);
+                }
+            }
+
+            // Embed Fields
+            if !embed.fields.is_empty() {
+                ui.add_space(2.0);
+                for field in &embed.fields {
+                    ui.label(RichText::new(&field.name).strong().size(12.0));
+                    ui.label(RichText::new(&field.value).size(12.0));
+                }
+            }
+
+            if let Some(img) = &embed.image {
+                if let Some(url) = img.best_url() {
+                    if load_images {
+                        let sz = match (img.width, img.height) {
+                            (Some(w), Some(h)) => image_fit(w, h, egui::vec2(420.0, 300.0)),
+                            _ => egui::vec2(320.0, 220.0),
+                        };
+                        let resp = ui.add(
+                            egui::Image::new(&url)
+                                .fit_to_exact_size(sz)
+                                .corner_radius(6.0)
+                                .sense(egui::Sense::click()),
+                        );
+                        if resp.clicked() {
+                            *open_image = Some(url);
+                        }
+                    } else if ui.button("\u{1F5BC} embedded image (click to view)").clicked() {
                         *open_image = Some(url);
                     }
-                } else if ui.button("\u{1F5BC} embedded image (click to view)").clicked() {
-                    *open_image = Some(url);
                 }
             }
-        }
-        if let Some(thumb) = &embed.thumbnail {
-            let is_video = embed.kind.as_deref() == Some("video") || embed.video.is_some();
-            let mut thumbnail_url = thumb.best_url();
-            if is_video {
-                // YouTube thumbnails are flaky through Discord's proxy; build a
-                // direct i.ytimg.com URL from the video id instead.
-                if let Some(id) = embed.url.as_deref().and_then(youtube_id) {
-                    thumbnail_url = Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"));
+
+            if let Some(thumb) = &embed.thumbnail {
+                let is_video = embed.kind.as_deref() == Some("video") || embed.video.is_some();
+                let mut thumbnail_url = thumb.best_url();
+                if is_video {
+                    // YouTube thumbnails are flaky through Discord's proxy; build a
+                    // direct i.ytimg.com URL from the video id instead.
+                    if let Some(id) = embed.url.as_deref().and_then(youtube_id) {
+                        thumbnail_url = Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"));
+                    }
                 }
-            }
-            if load_images {
-                if let Some(url) = thumbnail_url {
-                    let max = if is_video {
-                        egui::vec2(380.0, 260.0)
-                    } else {
-                        egui::vec2(120.0, 120.0)
-                    };
-                    let sz = match (thumb.width, thumb.height) {
-                        (Some(w), Some(h)) => image_fit(w, h, max),
-                        _ => if is_video { egui::vec2(380.0, 214.0) } else { egui::vec2(120.0, 90.0) },
-                    };
-                    let mut resp = ui.add(
-                        egui::Image::new(&url)
-                            .fit_to_exact_size(sz)
-                            .corner_radius(6.0)
-                            .sense(egui::Sense::click()),
-                    );
-                    if resp.clicked() {
-                        if let Some(u) = &embed.url {
+                if load_images {
+                    if let Some(url) = thumbnail_url {
+                        let max = if is_video {
+                            egui::vec2(380.0, 260.0)
+                        } else {
+                            egui::vec2(120.0, 120.0)
+                        };
+                        let sz = match (thumb.width, thumb.height) {
+                            (Some(w), Some(h)) => image_fit(w, h, max),
+                            _ => if is_video { egui::vec2(380.0, 214.0) } else { egui::vec2(120.0, 90.0) },
+                        };
+                        let mut resp = ui.add(
+                            egui::Image::new(&url)
+                                .fit_to_exact_size(sz)
+                                .corner_radius(6.0)
+                                .sense(egui::Sense::click()),
+                        );
+                        if resp.clicked() {
+                            if let Some(u) = &embed.url {
+                                open_url(u);
+                            }
+                        }
+                        if is_video {
+                            let label = match embed.provider.as_ref().and_then(|p| p.name.clone()) {
+                                Some(n) => format!("Play on {n}"),
+                                None => "Play video".to_string(),
+                            };
+                            resp = resp.on_hover_text(label);
+                        } else if let Some(u) = &embed.url {
+                            resp = resp.on_hover_text(u.clone());
+                        }
+                        let _ = resp;
+                    }
+                } else if is_video {
+                    if let Some(u) = &embed.url {
+                        if ui.button("\u{25B6} Watch").clicked() {
                             open_url(u);
                         }
                     }
-                    if is_video {
-                        let label = match embed.provider.as_ref().and_then(|p| p.name.clone()) {
-                            Some(n) => format!("Play on {n}"),
-                            None => "Play video".to_string(),
-                        };
-                        resp = resp.on_hover_text(label);
-                    } else if let Some(u) = &embed.url {
-                        resp = resp.on_hover_text(u.clone());
-                    }
-                    let _ = resp;
-                }
-            } else if is_video {
-                if let Some(u) = &embed.url {
-                    if ui.button("\u{25B6} Watch").clicked() {
-                        open_url(u);
-                    }
                 }
             }
-        }
-        if let Some(v) = &embed.video {
-            if let Some(u) = &v.url {
-                ui.hyperlink_to("Watch", u);
+
+            if let Some(v) = &embed.video {
+                if let Some(u) = &v.url {
+                    ui.hyperlink_to("\u{25B6} Watch Video", u);
+                }
             }
-        }
-    });
+
+            // Footer
+            if let Some(footer) = &embed.footer {
+                ui.horizontal(|ui| {
+                    if load_images {
+                        if let Some(icon) = &footer.icon_url {
+                            if !icon.is_empty() {
+                                ui.add(
+                                    egui::Image::new(icon)
+                                        .fit_to_exact_size(egui::vec2(14.0, 14.0))
+                                        .corner_radius(7.0),
+                                );
+                            }
+                        }
+                    }
+                    ui.weak(RichText::new(&footer.text).small());
+                });
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------

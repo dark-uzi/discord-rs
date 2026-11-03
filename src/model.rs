@@ -228,6 +228,10 @@ impl Channel {
         matches!(self.kind, 0 | 5)
     }
 
+    pub fn is_thread(&self) -> bool {
+        matches!(self.kind, 10 | 11 | 12)
+    }
+
     pub fn is_dm(&self) -> bool {
         matches!(self.kind, 1 | 3)
     }
@@ -354,6 +358,14 @@ pub struct Embed {
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
+    pub color: Option<u32>,
+    #[serde(default)]
+    pub author: Option<EmbedAuthor>,
+    #[serde(default)]
+    pub footer: Option<EmbedFooter>,
+    #[serde(default)]
+    pub fields: Vec<EmbedField>,
+    #[serde(default)]
     pub image: Option<EmbedImage>,
     #[serde(default)]
     pub thumbnail: Option<EmbedImage>,
@@ -361,6 +373,30 @@ pub struct Embed {
     pub video: Option<EmbedImage>,
     #[serde(default)]
     pub provider: Option<EmbedProvider>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmbedAuthor {
+    pub name: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmbedFooter {
+    pub text: String,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmbedField {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub inline: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

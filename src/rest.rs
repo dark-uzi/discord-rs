@@ -132,6 +132,51 @@ pub async fn get_relationships(client: &Client, token: &str) -> Result<Vec<Relat
     Ok(resp.json::<Vec<Relationship>>().await?)
 }
 
+/// Send a friend request by username.
+pub async fn add_friend_by_name(client: &Client, token: &str, username: &str, discriminator: Option<&str>) -> Result<()> {
+    let mut payload = json!({ "username": username });
+    if let Some(disc) = discriminator {
+        payload["discriminator"] = json!(disc);
+    }
+    let resp = client
+        .post(format!("{API}/users/@me/relationships"))
+        .header(AUTHORIZATION, token)
+        .header("X-Super-Properties", super_properties())
+        .header("X-Discord-Locale", "en-US")
+        .json(&payload)
+        .send()
+        .await?;
+    ensure_ok(resp).await?;
+    Ok(())
+}
+
+/// Accept or add a friend by user id (PUT /users/@me/relationships/{user_id}).
+pub async fn put_relationship(client: &Client, token: &str, user_id: &str) -> Result<()> {
+    let resp = client
+        .put(format!("{API}/users/@me/relationships/{user_id}"))
+        .header(AUTHORIZATION, token)
+        .header("X-Super-Properties", super_properties())
+        .header("X-Discord-Locale", "en-US")
+        .json(&json!({}))
+        .send()
+        .await?;
+    ensure_ok(resp).await?;
+    Ok(())
+}
+
+/// Remove a friend or cancel/reject a friend request (DELETE /users/@me/relationships/{user_id}).
+pub async fn delete_relationship(client: &Client, token: &str, user_id: &str) -> Result<()> {
+    let resp = client
+        .delete(format!("{API}/users/@me/relationships/{user_id}"))
+        .header(AUTHORIZATION, token)
+        .header("X-Super-Properties", super_properties())
+        .header("X-Discord-Locale", "en-US")
+        .send()
+        .await?;
+    ensure_ok(resp).await?;
+    Ok(())
+}
+
 /// Fetch all channels in a guild.
 pub async fn get_guild_channels(
     client: &Client,
@@ -146,7 +191,27 @@ pub async fn get_guild_channels(
         .send()
         .await?;
     let resp = ensure_ok(resp).await?;
-    Ok(resp.json::<Vec<Channel>>().await?)
+    let mut channels = resp.json::<Vec<Channel>>().await?;
+
+    // Also fetch active threads for the guild so threads appear under their channels.
+    if let Ok(resp_threads) = client
+        .get(format!("{API}/guilds/{guild_id}/threads/active"))
+        .header(AUTHORIZATION, token)
+        .header("X-Super-Properties", super_properties())
+        .header("X-Discord-Locale", "en-US")
+        .send()
+        .await
+    {
+        #[derive(serde::Deserialize)]
+        struct ActiveThreads {
+            threads: Vec<Channel>,
+        }
+        if let Ok(active) = resp_threads.json::<ActiveThreads>().await {
+            channels.extend(active.threads);
+        }
+    }
+
+    Ok(channels)
 }
 
 /// Fetch a single channel by id (used to resolve its guild when jumping from a

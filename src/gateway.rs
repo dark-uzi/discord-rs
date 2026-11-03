@@ -52,6 +52,7 @@ pub async fn run_session(
     client: reqwest::Client,
     token: String,
     cmd_rx: &mut UnboundedReceiver<Command>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>,
 ) -> Result<SessionEnd> {
     set_status(&shared, ConnectionStatus::Connecting, None);
 
@@ -73,7 +74,7 @@ pub async fn run_session(
     let mut backoff = Duration::from_secs(1);
 
     loop {
-        let result = run_gateway(&shared, &client, &token, cmd_rx, &mut session).await;
+        let result = run_gateway(&shared, &client, &token, cmd_rx, cmd_tx.clone(), &mut session).await;
 
         if session.auth_failed {
             set_status(
@@ -118,6 +119,7 @@ async fn run_gateway(
     client: &reqwest::Client,
     token: &str,
     cmd_rx: &mut UnboundedReceiver<Command>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>,
     session: &mut Session,
 ) -> Result<GatewayExit> {
     session.ready_this_run = false;
@@ -224,29 +226,31 @@ async fn run_gateway(
                                 let event = v["t"].as_str().unwrap_or_default().to_string();
                                 let fresh_ready = handle_dispatch(shared, &v, session);
                                 shared.lock().unwrap_or_else(|p| p.into_inner()).wake();
-                                if fresh_ready {
-                                    spawn_fetch_guilds(client.clone(), token.to_string(), shared.clone());
-                                    spawn_fetch_dms(client.clone(), token.to_string(), shared.clone());
+                                if fresh_ready || event == "RELATIONSHIP_ADD" || event == "RELATIONSHIP_REMOVE" {
+                                    if fresh_ready {
+                                        spawn_fetch_guilds(client.clone(), token.to_string(), shared.clone(), cmd_tx.clone());
+                                        spawn_fetch_dms(client.clone(), token.to_string(), shared.clone());
+                                    }
                                     spawn_fetch_relationships(client.clone(), token.to_string(), shared.clone());
                                 }
-                                // With `guild_subscriptions` on, Discord only sends
-                                // subscription-gated events (typing, presence, member
-                                // updates) for guilds we explicitly request via OP 14.
-                                // Subscribe to every guild on READY (this also triggers
-                                // GUILD_CREATE). Keep the payloads tiny: no channel
-                                // ranges, otherwise oversized OP 14 frames get the
-                                // connection closed with 4002.
                                 if event == "READY" {
                                     let subs: Vec<Value> = {
                                         let s = shared.lock().unwrap_or_else(|p| p.into_inner());
                                         s.guilds
                                             .iter()
-                                            .map(|g| guild_subscription(&g.id))
+                                            .map(|g| guild_subscription(&g.id, None))
                                             .collect()
                                     };
                                     for payload in subs {
                                         let _ = sink
                                             .send(WsMessage::Text(payload.to_string().into()))
+                                            .await;
+                                    }
+                                } else if event == "GUILD_CREATE" {
+                                    if let Some(gid) = v["d"]["id"].as_str() {
+                                        let sub = guild_subscription(gid, None);
+                                        let _ = sink
+                                            .send(WsMessage::Text(sub.to_string().into()))
                                             .await;
                                     }
                                 }
@@ -460,6 +464,60 @@ async fn run_gateway(
                     Some(Command::OpenDm(user_id)) => {
                         spawn_open_dm(client.clone(), token.to_string(), shared.clone(), user_id);
                     }
+                    Some(Command::SubscribeGuild(guild_id)) => {
+                        let sub = guild_subscription(&guild_id, None);
+                        let _ = sink.send(WsMessage::Text(sub.to_string().into())).await;
+                    }
+                    Some(Command::SubscribeChannel { guild_id, channel_id }) => {
+                        let sub = guild_subscription(&guild_id, Some(&channel_id));
+                        let _ = sink.send(WsMessage::Text(sub.to_string().into())).await;
+                    }
+                    Some(Command::SendFriendRequest(username)) => {
+                        let (client, token, shared) = (client.clone(), token.to_string(), shared.clone());
+                        tokio::spawn(async move {
+                            let (name, disc) = match username.split_once('#') {
+                                Some((n, d)) => (n, Some(d)),
+                                None => (username.as_str(), None),
+                            };
+                            match rest::add_friend_by_name(&client, &token, name, disc).await {
+                                Ok(()) => {
+                                    spawn_fetch_relationships(client, token, shared);
+                                }
+                                Err(e) => {
+                                    eprintln!("send friend request failed: {e:#}");
+                                    shared.lock().unwrap_or_else(|p| p.into_inner()).push_error(format!("Failed to send friend request: {e}"));
+                                }
+                            }
+                        });
+                    }
+                    Some(Command::AcceptFriendRequest(user_id)) => {
+                        let (client, token, shared) = (client.clone(), token.to_string(), shared.clone());
+                        tokio::spawn(async move {
+                            match rest::put_relationship(&client, &token, &user_id).await {
+                                Ok(()) => {
+                                    spawn_fetch_relationships(client, token, shared);
+                                }
+                                Err(e) => {
+                                    eprintln!("accept friend request failed: {e:#}");
+                                    shared.lock().unwrap_or_else(|p| p.into_inner()).push_error(format!("Failed to accept friend request: {e}"));
+                                }
+                            }
+                        });
+                    }
+                    Some(Command::RemoveFriend(user_id)) => {
+                        let (client, token, shared) = (client.clone(), token.to_string(), shared.clone());
+                        tokio::spawn(async move {
+                            match rest::delete_relationship(&client, &token, &user_id).await {
+                                Ok(()) => {
+                                    spawn_fetch_relationships(client, token, shared);
+                                }
+                                Err(e) => {
+                                    eprintln!("remove friend failed: {e:#}");
+                                    shared.lock().unwrap_or_else(|p| p.into_inner()).push_error(format!("Failed to remove relationship: {e}"));
+                                }
+                            }
+                        });
+                    }
                     Some(Command::Disconnect) => {
                         let _ = sink.close().await;
                         return Ok(GatewayExit::Disconnect);
@@ -504,17 +562,28 @@ fn spawn_fetch_messages(
     });
 }
 
-fn spawn_fetch_guilds(client: reqwest::Client, token: String, shared: Arc<Mutex<SharedState>>) {
+fn spawn_fetch_guilds(
+    client: reqwest::Client,
+    token: String,
+    shared: Arc<Mutex<SharedState>>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>,
+) {
     tokio::spawn(async move {
         match rest::get_guilds(&client, &token).await {
             Ok(guilds) => {
-                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
-                for guild in guilds {
-                    s.upsert_guild(guild);
+                let ids: Vec<String> = guilds.iter().map(|g| g.id.clone()).collect();
+                {
+                    let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+                    for guild in guilds {
+                        s.upsert_guild(guild);
+                    }
+                    s.sort_guilds();
+                    s.wake();
+                    eprintln!("loaded {} guilds via REST", s.guilds.len());
                 }
-                s.sort_guilds();
-                s.wake();
-                eprintln!("loaded {} guilds via REST", s.guilds.len());
+                for id in ids {
+                    let _ = cmd_tx.send(Command::SubscribeGuild(id));
+                }
             }
             Err(e) => eprintln!("fetch guilds failed: {e:#}"),
         }
@@ -676,9 +745,12 @@ fn spawn_fetch_dms(client: reqwest::Client, token: String, shared: Arc<Mutex<Sha
 
 /// Builds an OP 14 "guild subscriptions" payload. Enabling `typing` makes
 /// Discord dispatch TYPING_START for the guild; `activities` keeps presence
-/// fresh. Channels are deliberately left empty -- subscribing to every
-/// channel's member ranges bloats the frame and gets the connection closed.
-fn guild_subscription(guild_id: &str) -> Value {
+/// fresh. If `channel_id` is provided, requests the top 100 members via `[[0, 99]]`.
+fn guild_subscription(guild_id: &str, channel_id: Option<&str>) -> Value {
+    let mut channels = serde_json::Map::new();
+    if let Some(cid) = channel_id {
+        channels.insert(cid.to_string(), json!([[0, 99]]));
+    }
     json!({
         "op": 14,
         "d": {
@@ -687,7 +759,7 @@ fn guild_subscription(guild_id: &str) -> Value {
             "threads": false,
             "activities": true,
             "members": [],
-            "channels": {},
+            "channels": channels,
         }
     })
 }
@@ -797,9 +869,60 @@ fn handle_dispatch(shared: &Arc<Mutex<SharedState>>, v: &Value, session: &mut Se
                 shared.lock().unwrap_or_else(|p| p.into_inner()).set_presence(guild_id, user_id, status);
             }
         }
-        "CHANNEL_CREATE" | "CHANNEL_UPDATE" => {
+        "GUILD_MEMBERS_CHUNK" => {
+            if let Some(guild_id) = data["guild_id"].as_str() {
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(members) = data["members"].as_array() {
+                    for m in members {
+                        if let Ok(member) = serde_json::from_value::<crate::model::Member>(m.clone()) {
+                            s.users.insert(member.user.id.clone(), member.user.clone());
+                            s.upsert_member(guild_id, member);
+                        }
+                    }
+                }
+            }
+        }
+        "GUILD_MEMBER_LIST_UPDATE" => {
+            if let Some(guild_id) = data["guild_id"].as_str() {
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(ops) = data["ops"].as_array() {
+                    for op in ops {
+                        if let Some(items) = op["items"].as_array() {
+                            for item in items {
+                                if let Some(m_val) = item.get("member") {
+                                    if let Ok(member) = serde_json::from_value::<crate::model::Member>(m_val.clone()) {
+                                        s.users.insert(member.user.id.clone(), member.user.clone());
+                                        s.upsert_member(guild_id, member);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(item) = op.get("item") {
+                            if let Some(m_val) = item.get("member") {
+                                if let Ok(member) = serde_json::from_value::<crate::model::Member>(m_val.clone()) {
+                                    s.users.insert(member.user.id.clone(), member.user.clone());
+                                    s.upsert_member(guild_id, member);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "RELATIONSHIP_ADD" | "RELATIONSHIP_REMOVE" => {}
+        "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "THREAD_CREATE" | "THREAD_UPDATE" => {
             if let Ok(channel) = serde_json::from_value::<Channel>(data.clone()) {
                 shared.lock().unwrap_or_else(|p| p.into_inner()).add_channel(channel);
+            }
+        }
+        "THREAD_LIST_SYNC" => {
+            if let Some(threads) = data["threads"].as_array() {
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+                for t in threads {
+                    if let Ok(ch) = serde_json::from_value::<Channel>(t.clone()) {
+                        s.add_channel(ch);
+                    }
+                }
             }
         }
         "MESSAGE_CREATE" => {
