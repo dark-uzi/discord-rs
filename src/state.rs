@@ -596,6 +596,18 @@ impl SharedState {
     pub fn set_presence(&mut self, guild_id: &str, user_id: &str, status: &str) {
         self.presences
             .insert(user_id.to_string(), status.to_string());
+        if !guild_id.is_empty() {
+            if let Some(u) = self.users.get(user_id) {
+                self.upsert_member(
+                    guild_id,
+                    Member {
+                        user: u.clone(),
+                        nick: None,
+                        roles: Vec::new(),
+                    },
+                );
+            }
+        }
         if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild_id) {
             if let Some(slot) = guild.presences.iter_mut().find(|p| p.user.id == user_id) {
                 slot.status = Some(status.to_string());
@@ -685,6 +697,17 @@ impl SharedState {
         }
         self.users
             .insert(message.author.id.clone(), message.author.clone());
+        let guild_id = self.channels.get(&message.channel_id).and_then(|c| c.guild_id.clone());
+        if let Some(gid) = guild_id {
+            self.upsert_member(
+                &gid,
+                Member {
+                    user: message.author.clone(),
+                    nick: None,
+                    roles: Vec::new(),
+                },
+            );
+        }
         let list = self.messages.entry(message.channel_id.clone()).or_default();
         if !list.iter().any(|m| m.id == message.id) {
             list.push(message);
@@ -903,6 +926,17 @@ impl SharedState {
         chans
     }
 
+    pub fn threads(&self, guild_id: &str) -> Vec<Channel> {
+        let mut threads: Vec<Channel> = self
+            .channels
+            .values()
+            .filter(|c| c.guild_id.as_deref() == Some(guild_id) && c.is_thread())
+            .cloned()
+            .collect();
+        threads.sort_by_key(|c| c.sort_key());
+        threads
+    }
+
     pub fn voice_channels(&self, guild_id: &str) -> Vec<Channel> {
         let mut chans: Vec<Channel> = self
             .channels
@@ -977,6 +1011,11 @@ pub enum Command {
     KickUser { guild_id: String, user_id: String, reason: Option<String> },
     BanUser { guild_id: String, user_id: String, reason: Option<String> },
     TimeoutUser { guild_id: String, user_id: String, seconds: u64, reason: Option<String> },
+    SubscribeGuild(String),
+    SubscribeChannel { guild_id: String, channel_id: String },
+    SendFriendRequest(String),
+    AcceptFriendRequest(String),
+    RemoveFriend(String),
     Disconnect,
 }
 

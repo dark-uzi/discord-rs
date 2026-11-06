@@ -22,6 +22,7 @@ fn main() -> eframe::Result<()> {
     // Discord backend: runs on its own tokio runtime in a background thread.
     {
         let shared = shared.clone();
+        let bg_cmd_tx = cmd_tx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -33,7 +34,7 @@ fn main() -> eframe::Result<()> {
                 while let Some(command) = cmd_rx.recv().await {
                     if let Command::Connect(token) = command {
                         let result =
-                            gateway::run_session(shared.clone(), client.clone(), token, &mut cmd_rx)
+                            gateway::run_session(shared.clone(), client.clone(), token, &mut cmd_rx, bg_cmd_tx.clone())
                                 .await;
 
                         match result {

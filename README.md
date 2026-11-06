@@ -14,6 +14,8 @@ A native desktop Discord client written in Rust with [egui](https://github.com/e
 - Attachments and image viewing/upload (drag-drop, file picker, clipboard paste)
 - Emoji reactions and an emoji picker
 - Typing indicators, presence, and member list
+- Threads support (nested thread channels, active thread synchronization)
+- Friend requests (accept, deny, remove, and add friend)
 - Mentions with highlighting, autocomplete for `@` users and `#` channels
 - Custom per-scope nicknames (aliases) for other users
 - Search, pins, a quick switcher (`Ctrl+K`), and a message edit/delete log
@@ -38,12 +40,9 @@ Settings and nicknames are stored alongside it (`settings.json`, `aliases.json`,
 
 ## Known Issues / Bugs
 
-- **Typing indicators don't appear.** The gateway events are requested
-  (`GUILD_MESSAGE_TYPING` / `DIRECT_MESSAGE_TYPING` + `guild_subscriptions`);
-  still being diagnosed.
-- **Member list is often empty.** Discord returns `403` for
-  `/guilds/{id}/members` on user tokens, so the list only shows what the gateway
-  already sent. The UI shows "unavailable" when that happens.
+- **Member list:** Discord returns `403` for `/guilds/{id}/members` on user tokens,
+  so member lists are dynamically populated via OP 14 member subscription ranges,
+  presence updates, message history, and chunk events.
 - **No voice/video.** Joining voice channels is not implemented (see below).
 - The client is **Windows-first** — clipboard image paste uses Windows APIs
   (`clipboard-win`), so it may not work the same on other platforms.
@@ -56,12 +55,10 @@ Settings and nicknames are stored alongside it (`settings.json`, `aliases.json`,
 
 - **Voice & video** — blocked: real voice needs Discord's DAVE end-to-end
   encryption (MLS / RFC 9420, `libdave`), which isn't implemented.
-- **Threads** — viewing, creating, and replying in threads.
 - **Slash / application commands** and interactions.
 - **Server-wide message search** (only the currently loaded channel is searched).
 - **Native OS notifications** (currently in-app toasts + an in-app history).
 - **Server & channel management** — roles, permissions, channels, categories.
-- **Friend requests** — accept/deny/remove from the UI (currently view-only).
 - **Group DMs** — creation and management.
 - **GIF/sticker picker** (Tenor/Giphy) and scheduled events.
 - **Server onboarding / join-by-invite** flow.
