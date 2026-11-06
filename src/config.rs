@@ -69,10 +69,32 @@ pub fn save_token(token: &str) {
     let path = session_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
     if let Ok(data) = serde_json::to_string(&SessionFile {
         token: token.to_string(),
     }) {
+        // Security: Restrict session token file to owner-only read/write (0600 on Unix)
+        // to prevent sensitive authentication tokens from leaking to other local users.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                let _ = f.write_all(data.as_bytes());
+                return;
+            }
+        }
         let _ = std::fs::write(path, data);
     }
 }
@@ -185,6 +207,31 @@ mod tests {
     fn test_app_dir_path_structure() {
         let dir = app_dir();
         assert!(dir.ends_with("discord-rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_token_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let test_token = "sentinel_test_token_12345";
+        save_token(test_token);
+
+        let path = session_path();
+        assert!(path.exists(), "session file should exist");
+
+        let file_meta = std::fs::metadata(&path).expect("file metadata");
+        let file_mode = file_meta.permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "session file should be restricted to 0600");
+
+        if let Some(parent) = path.parent() {
+            let dir_meta = std::fs::metadata(parent).expect("parent metadata");
+            let dir_mode = dir_meta.permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "app dir should be restricted to 0700");
+        }
+
+        clear_token();
+        assert!(!path.exists(), "session file should be deleted on clear");
     }
 }
 
