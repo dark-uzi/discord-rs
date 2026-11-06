@@ -9,7 +9,7 @@ use crate::format::{active_autocomplete, active_shortcode, big_emoji, is_image_p
 use crate::markdown::{self, Seg};
 use crate::model::{Attachment, Embed, Emoji, Member, Message, User};
 use crate::state::{Command, ConnectionStatus, LogEntry, LogKind, PendingFile, SharedState, DM_HOME};
-use crate::widgets::{avatar_ring, badge, emoji_button, encode_png, flatten_menu, image_fit, open_url, presence_rank, render_plain, render_reply_line, window_header};
+use crate::widgets::{avatar_ring, badge, emoji_button, encode_png, flatten_menu, image_fit, is_safe_url, open_url, presence_rank, render_plain, render_reply_line, window_header};
 
 #[cfg(target_os = "windows")]
 use crate::widgets::dib_to_rgba;
@@ -4472,7 +4472,11 @@ fn render_attachment(
             }
         }
     } else if let Some(url) = &attachment.url {
-        ui.hyperlink_to(format!("\u{1F4CE} {}", attachment.filename), url);
+        if is_safe_url(url) {
+            ui.hyperlink_to(format!("\u{1F4CE} {}", attachment.filename), url);
+        } else {
+            ui.weak(format!("\u{1F4CE} {}", attachment.filename));
+        }
     } else {
         ui.weak(format!("\u{1F4CE} {}", attachment.filename));
     }
@@ -4520,6 +4524,17 @@ fn render_embed(
                 if let Some(pname) = &provider.name {
                     ui.weak(pname);
                 }
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_max_width(440.0);
+        if let Some(title) = &embed.title {
+            if let Some(url) = &embed.url {
+                if is_safe_url(url) {
+                    ui.hyperlink_to(RichText::new(title).strong(), url);
+                } else {
+                    ui.label(RichText::new(title).strong());
+                }
+            } else {
+                ui.label(RichText::new(title).strong());
             }
 
             if let Some(title) = &embed.title {
@@ -4622,6 +4637,13 @@ fn render_embed(
             if let Some(v) = &embed.video {
                 if let Some(u) = &v.url {
                     ui.hyperlink_to("\u{25B6} Watch Video", u);
+        }
+        if let Some(v) = &embed.video {
+            if let Some(u) = &v.url {
+                if is_safe_url(u) {
+                    ui.hyperlink_to("Watch", u);
+                } else {
+                    ui.weak("Watch");
                 }
             }
 
@@ -4777,7 +4799,11 @@ fn render_segments(
                     let _ = name;
                 }
                 Seg::Url(u) => {
-                    ui.hyperlink_to(u.clone(), u.clone());
+                    if is_safe_url(&u) {
+                        ui.hyperlink_to(u.clone(), u.clone());
+                    } else {
+                        ui.label(u);
+                    }
                 }
             }
         }

@@ -72,16 +72,21 @@ pub(crate) fn badge(ui: &egui::Ui, rect: egui::Rect, count: u32, mention: bool) 
     );
 }
 
-pub(crate) fn open_url(url: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn();
+/// Validates that a URL uses a safe web scheme (HTTP or HTTPS), is case-insensitive,
+/// contains no ASCII control characters, and has content beyond the scheme prefix.
+pub(crate) fn is_safe_url(url: &str) -> bool {
+    if url.chars().any(|c| c.is_ascii_control()) {
+        return false;
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = url;
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    (lower.starts_with("http://") && lower.len() > 7)
+        || (lower.starts_with("https://") && lower.len() > 8)
+}
+
+pub(crate) fn open_url(url: &str) {
+    if is_safe_url(url) {
+        let _ = webbrowser::open(url);
     }
 }
 
@@ -280,5 +285,29 @@ pub(crate) fn emoji_button(ui: &mut egui::Ui, ch: &str, size: f32) -> egui::Resp
             egui::Image::new(&url).fit_to_exact_size(egui::vec2(size, size)),
         )),
         None => ui.add(egui::Button::new(ch)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_url() {
+        assert!(is_safe_url("https://discord.com"));
+        assert!(is_safe_url("http://example.com/test"));
+        assert!(is_safe_url("  HTTPS://DISCORD.COM  "));
+        assert!(is_safe_url("Http://example.com"));
+        assert!(is_safe_url("hTtPs://example.com"));
+
+        assert!(!is_safe_url("http://"));
+        assert!(!is_safe_url("https://"));
+        assert!(!is_safe_url("http://example.com\r\n"));
+        assert!(!is_safe_url("http://example.com\0"));
+
+        assert!(!is_safe_url("file:///C:/Windows/System32/cmd.exe"));
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("calc.exe"));
+        assert!(!is_safe_url("ftp://example.com"));
     }
 }

@@ -131,7 +131,11 @@ pub(crate) fn custom_emoji_in(tok: &str) -> Option<String> {
     let mut it = body.split(':');
     let name = it.next()?;
     let id = it.next()?;
-    if it.next().is_some() || name.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+    if it.next().is_some()
+        || name.is_empty()
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        || !id.chars().all(|c| c.is_ascii_digit())
+    {
         return None;
     }
     let ext = if animated { "gif" } else { "png" };
@@ -538,6 +542,9 @@ mod tests {
         assert!(custom_emoji_in(":wave:").is_none());
         assert!(custom_emoji_in("<:bad:notnum>").is_none());
         assert!(custom_emoji_in("plain").is_none());
+        assert!(custom_emoji_in("<:pepe/../admin:12345>").is_none());
+        assert!(custom_emoji_in("<:bad name:123>").is_none());
+        assert!(custom_emoji_in("<:emoji.png:123>").is_none());
     }
 
     #[test]
