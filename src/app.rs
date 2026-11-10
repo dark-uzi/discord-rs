@@ -4515,7 +4515,11 @@ fn render_embed(
                         }
                     }
                     if let Some(url) = &author.url {
-                        ui.hyperlink_to(RichText::new(&author.name).small().strong(), url);
+                        if is_safe_url(url) {
+                            ui.hyperlink_to(RichText::new(&author.name).small().strong(), url);
+                        } else {
+                            ui.label(RichText::new(&author.name).small().strong());
+                        }
                     } else {
                         ui.label(RichText::new(&author.name).small().strong());
                     }
@@ -4524,22 +4528,16 @@ fn render_embed(
                 if let Some(pname) = &provider.name {
                     ui.weak(pname);
                 }
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_max_width(440.0);
-        if let Some(title) = &embed.title {
-            if let Some(url) = &embed.url {
-                if is_safe_url(url) {
-                    ui.hyperlink_to(RichText::new(title).strong(), url);
-                } else {
-                    ui.label(RichText::new(title).strong());
-                }
-            } else {
-                ui.label(RichText::new(title).strong());
             }
 
+            // Title
             if let Some(title) = &embed.title {
                 if let Some(url) = &embed.url {
-                    ui.hyperlink_to(RichText::new(title).strong().size(14.0), url);
+                    if is_safe_url(url) {
+                        ui.hyperlink_to(RichText::new(title).strong().size(14.0), url);
+                    } else {
+                        ui.label(RichText::new(title).strong().size(14.0));
+                    }
                 } else {
                     ui.label(RichText::new(title).strong().size(14.0));
                 }
@@ -4636,14 +4634,11 @@ fn render_embed(
 
             if let Some(v) = &embed.video {
                 if let Some(u) = &v.url {
-                    ui.hyperlink_to("\u{25B6} Watch Video", u);
-        }
-        if let Some(v) = &embed.video {
-            if let Some(u) = &v.url {
-                if is_safe_url(u) {
-                    ui.hyperlink_to("Watch", u);
-                } else {
-                    ui.weak("Watch");
+                    if is_safe_url(u) {
+                        ui.hyperlink_to("\u{25B6} Watch Video", u);
+                    } else {
+                        ui.weak("\u{25B6} Watch Video");
+                    }
                 }
             }
 
